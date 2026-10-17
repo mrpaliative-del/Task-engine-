@@ -186,33 +186,28 @@ class TargetRegistration(BaseModel):
 @app.get("/api/health")
 def health():
     """
-    Verify a real database connection.
-    This does not merely check whether the API process is running.
+    Verify a real database connection and table existence using robust checks.
     """
     try:
         with connect_database() as conn:
             conn.execute("SELECT 1").fetchone()
 
-            tables = conn.execute(
+            # Check table existence securely using regclass
+            res = conn.execute(
                 """
-                SELECT COUNT(*) AS table_count
-                FROM information_schema.tables
-                WHERE table_schema = current_schema()
-                  AND table_name IN (
-                      'targets',
-                      'tasks',
-                      'task_events'
-                  )
-                  AND table_type = 'BASE TABLE'
+                SELECT 
+                    to_regclass('public.targets') AS targets_table,
+                    to_regclass('public.tasks') AS tasks_table,
+                    to_regclass('public.task_events') AS events_table
                 """
             ).fetchone()
 
-            if tables["table_count"] != 3:
+            if not res or not res.get("targets_table") or not res.get("tasks_table") or not res.get("events_table"):
                 raise HTTPException(
                     status_code=503,
                     detail=(
-                        "Database connected, but the required schema "
-                        "is incomplete. Run the database initializer."
+                        "Database connected, but required tables "
+                        "('targets', 'tasks', 'task_events') are missing."
                     ),
                 )
 
@@ -225,14 +220,12 @@ def health():
     except HTTPException:
         raise
 
-    except (psycopg.Error, RuntimeError) as exc:
-        print(f"Health check failed: {type(exc).__name__}")
+    except Exception as exc:
+        error_str = f"{type(exc).__name__}: {str(exc)}"
+        print(f"Health check failed: {error_str}")
         raise HTTPException(
             status_code=503,
-            detail=(
-                "Database unavailable. Check DATABASE_URL and "
-                "the Neon database status."
-            ),
+            detail=f"Database unavailable -> {error_str}",
         ) from exc
 
 
