@@ -10,16 +10,8 @@ from fastapi import Depends, FastAPI, HTTPException, Query, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field, field_validator
 
+
 app = FastAPI(
-    @app.get("/")
-def root():
-    return {
-        "service": "SolveEase 300-Target Task Engine API",
-        "version": "1.1.0",
-        "status": "running",
-        "health_endpoint": "/api/health",
-        "documentation": "/docs",
-    }
     title="SolveEase 300-Target Task Engine API",
     version="1.1.0",
 )
@@ -30,6 +22,25 @@ security = HTTPBearer(auto_error=False)
 
 ALLOWED_METHODS = {"httpx", "playwright", "websocket"}
 
+
+# --------------------------------------------------
+# ROOT DIAGNOSTIC
+# --------------------------------------------------
+
+@app.get("/")
+def root():
+    return {
+        "service": "SolveEase 300-Target Task Engine API",
+        "version": "1.1.0",
+        "status": "running",
+        "health_endpoint": "/api/health",
+        "documentation": "/docs",
+    }
+
+
+# --------------------------------------------------
+# API AUTHENTICATION
+# --------------------------------------------------
 
 def verify_api_key(
     credentials: HTTPAuthorizationCredentials | None = Depends(security),
@@ -52,6 +63,10 @@ def verify_api_key(
     return True
 
 
+# --------------------------------------------------
+# DATABASE ACCESS
+# --------------------------------------------------
+
 def query_db(sql, params=()):
     if not os.path.isfile(DB_FILE):
         raise HTTPException(
@@ -63,16 +78,22 @@ def query_db(sql, params=()):
         with closing(sqlite3.connect(DB_FILE, timeout=10)) as conn:
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA busy_timeout = 10000")
+
             return [
                 dict(row)
                 for row in conn.execute(sql, params).fetchall()
             ]
+
     except sqlite3.Error as exc:
         raise HTTPException(
             status_code=503,
             detail="Database operation failed.",
         ) from exc
 
+
+# --------------------------------------------------
+# TARGET REGISTRATION VALIDATION
+# --------------------------------------------------
 
 class TargetRegistration(BaseModel):
     platform_name: str = Field(min_length=2, max_length=100)
@@ -84,18 +105,22 @@ class TargetRegistration(BaseModel):
     @classmethod
     def validate_name(cls, value):
         value = value.strip()
+
         if not value:
             raise ValueError("Platform name cannot be empty.")
+
         return value
 
     @field_validator("extraction_method")
     @classmethod
     def validate_method(cls, value):
         value = value.strip().lower()
+
         if value not in ALLOWED_METHODS:
             raise ValueError(
                 "Method must be httpx, playwright, or websocket."
             )
+
         return value
 
     @field_validator("api_endpoint")
@@ -104,8 +129,7 @@ class TargetRegistration(BaseModel):
         value = value.strip()
         parsed = urlparse(value)
 
-        allowed_schemes = {"https", "wss"}
-        if parsed.scheme not in allowed_schemes:
+        if parsed.scheme not in {"https", "wss"}:
             raise ValueError("Endpoint must use HTTPS or WSS.")
 
         if not parsed.hostname or parsed.username or parsed.password:
@@ -114,32 +138,47 @@ class TargetRegistration(BaseModel):
             )
 
         host = parsed.hostname.lower()
+
         if host in {"localhost", "localhost.localdomain"}:
             raise ValueError("Localhost targets are not permitted.")
 
+        # Reject non-public IP literals.
         try:
             address = ipaddress.ip_address(host)
-            if not address.is_global:
-                raise ValueError("Private or non-public IPs are not permitted.")
-        except ValueError as exc:
-            # Distinguish a rejected IP address from a DNS hostname.
-            if "not permitted" in str(exc):
-                raise
-            if ":" in host and not host.startswith("["):
-                raise ValueError("Invalid IP address.")
+        except ValueError:
+            address = None
+
+        if address is not None and not address.is_global:
+            raise ValueError(
+                "Private or non-public IPs are not permitted."
+            )
 
         return value
 
 
+# --------------------------------------------------
+# HEALTH CHECK
+# --------------------------------------------------
+
 @app.get("/api/health")
 def health():
-    # Deliberately exposes no queue or target details.
     if not os.path.isfile(DB_FILE):
-        raise HTTPException(status_code=503, detail="Database unavailable.")
+        raise HTTPException(
+            status_code=503,
+            detail="Database unavailable.",
+        )
+
     return {"status": "ok"}
 
 
-@app.get("/api/summary", dependencies=[Depends(verify_api_key)])
+# --------------------------------------------------
+# TASK AND QUEUE SUMMARY
+# --------------------------------------------------
+
+@app.get(
+    "/api/summary",
+    dependencies=[Depends(verify_api_key)],
+)
 def get_summary():
     result = query_db("""
         SELECT
@@ -155,39 +194,76 @@ def get_summary():
             (SELECT COUNT(*) FROM tasks
              WHERE status = 'failed') AS failed
     """)
+
     return result[0]
 
 
-@app.get("/api/queue/top", dependencies=[Depends(verify_api_key)])
+@app.get(
+    "/api/queue/top",
+    dependencies=[Depends(verify_api_key)],
+)
 def get_top_tasks(
     limit: int = Query(default=10, ge=1, le=100),
 ):
     tasks = query_db("""
         SELECT
-            task_id, source_platform, category,
-            payout_usd, est_seconds, roc_score,
-            status, created_at
+            task_id,
+            source_platform,
+            category,
+            payout_usd,
+            est_seconds,
+            roc_score,
+            status,
+            created_at
         FROM tasks
         WHERE status = 'pending'
           AND available_at <= CURRENT_TIMESTAMP
-        ORDER BY roc_score DESC, created_at ASC, id ASC
+        ORDER BY
+            roc_score DESC,
+            created_at ASC,
+            id ASC
         LIMIT ?
     """, (limit,))
-    return {"count": len(tasks), "top_queue": tasks}
+
+    return {
+        "count": len(tasks),
+        "top_queue": tasks,
+    }
 
 
-@app.get("/api/targets", dependencies=[Depends(verify_api_key)])
+# --------------------------------------------------
+# TARGET LIST
+# --------------------------------------------------
+
+@app.get(
+    "/api/targets",
+    dependencies=[Depends(verify_api_key)],
+)
 def get_targets():
     targets = query_db("""
         SELECT
-            platform_name, api_endpoint, extraction_method,
-            tier, is_active, consecutive_empty_polls,
-            consecutive_failures, last_checked, cooldown_until
+            platform_name,
+            api_endpoint,
+            extraction_method,
+            tier,
+            is_active,
+            consecutive_empty_polls,
+            consecutive_failures,
+            last_checked,
+            cooldown_until
         FROM targets
         ORDER BY tier, platform_name
     """)
-    return {"count": len(targets), "targets": targets}
 
+    return {
+        "count": len(targets),
+        "targets": targets,
+    }
+
+
+# --------------------------------------------------
+# REGISTER A TARGET
+# --------------------------------------------------
 
 @app.post(
     "/api/targets/register",
@@ -196,24 +272,40 @@ def get_targets():
 )
 def register_target(target: TargetRegistration):
     parsed = urlparse(target.api_endpoint)
+
     expected_scheme = (
-        "wss" if target.extraction_method == "websocket" else "https"
+        "wss"
+        if target.extraction_method == "websocket"
+        else "https"
     )
 
     if parsed.scheme != expected_scheme:
         raise HTTPException(
             status_code=422,
-            detail=f"{target.extraction_method} requires {expected_scheme}://",
+            detail=(
+                f"{target.extraction_method} requires "
+                f"{expected_scheme}://"
+            ),
         )
 
-    # Registration is restricted to the configured database.
+    if not os.path.isfile(DB_FILE):
+        raise HTTPException(
+            status_code=503,
+            detail="Database not found. Initialize schema.sql first.",
+        )
+
     try:
         with closing(sqlite3.connect(DB_FILE, timeout=10)) as conn:
             conn.execute("PRAGMA busy_timeout = 10000")
+
             cursor = conn.execute("""
-                INSERT OR IGNORE INTO targets
-                    (platform_name, api_endpoint, extraction_method, tier,
-                     is_active)
+                INSERT OR IGNORE INTO targets (
+                    platform_name,
+                    api_endpoint,
+                    extraction_method,
+                    tier,
+                    is_active
+                )
                 VALUES (?, ?, ?, ?, 0)
             """, (
                 target.platform_name,
@@ -221,15 +313,21 @@ def register_target(target: TargetRegistration):
                 target.extraction_method,
                 target.tier,
             ))
+
             conn.commit()
 
             if cursor.rowcount == 0:
                 raise HTTPException(
                     status_code=409,
-                    detail="A target with this platform name already exists.",
+                    detail=(
+                        "A target with this platform name "
+                        "already exists."
+                    ),
                 )
+
     except HTTPException:
         raise
+
     except sqlite3.Error as exc:
         raise HTTPException(
             status_code=503,
@@ -241,5 +339,8 @@ def register_target(target: TargetRegistration):
         "platform_name": target.platform_name,
         "tier": target.tier,
         "is_active": False,
-        "message": "Registered inactive. Verify the source before activation.",
+        "message": (
+            "Registered inactive. Verify the source "
+            "before activation."
+        ),
     }
