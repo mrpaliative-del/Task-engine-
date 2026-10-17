@@ -11,6 +11,15 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field, field_validator
 
 app = FastAPI(
+    @app.get("/")
+def root():
+    return {
+        "service": "SolveEase 300-Target Task Engine API",
+        "version": "1.1.0",
+        "status": "running",
+        "health_endpoint": "/api/health",
+        "documentation": "/docs",
+    }
     title="SolveEase 300-Target Task Engine API",
     version="1.1.0",
 )
