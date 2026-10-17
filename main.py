@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 """
 SolveEase 300-Target Task Engine API
@@ -47,10 +46,12 @@ def connect_database():
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL is not configured.")
 
+    # Clean up any accidental wrapping quotes or whitespace from Render env vars
+    clean_url = DATABASE_URL.strip().strip("'").strip('"')
+
     return psycopg.connect(
-        DATABASE_URL,
-        connect_timeout=10,
-        sslmode="require",
+        clean_url,
+        connect_timeout=15,
         row_factory=dict_row,
     )
 
@@ -63,7 +64,6 @@ def query_db(sql: str, params=()) -> list[dict]:
             return [dict(row) for row in rows]
 
     except (psycopg.Error, RuntimeError) as exc:
-        # Log technical details privately in the service logs.
         print(f"Database query failed: {type(exc).__name__}")
         raise HTTPException(
             status_code=503,
@@ -127,22 +127,18 @@ class TargetRegistration(BaseModel):
     @classmethod
     def validate_name(cls, value):
         value = value.strip()
-
         if not value:
             raise ValueError("Platform name cannot be empty.")
-
         return value
 
     @field_validator("extraction_method")
     @classmethod
     def validate_method(cls, value):
         value = value.strip().lower()
-
         if value not in ALLOWED_METHODS:
             raise ValueError(
                 "Method must be httpx, playwright, or websocket."
             )
-
         return value
 
     @field_validator("api_endpoint")
@@ -153,7 +149,6 @@ class TargetRegistration(BaseModel):
         try:
             parsed = urlparse(value)
             hostname = parsed.hostname
-            # Accessing .port also validates malformed port syntax.
             _ = parsed.port
         except ValueError as exc:
             raise ValueError("Endpoint URL is malformed.") from exc
@@ -171,7 +166,6 @@ class TargetRegistration(BaseModel):
         if host in {"localhost", "localhost.localdomain"}:
             raise ValueError("Localhost targets are not permitted.")
 
-        # Reject non-public IP literals.
         try:
             address = ipaddress.ip_address(host)
         except ValueError:
@@ -267,7 +261,6 @@ def get_summary():
              WHERE status = 'failed') AS failed
         """
     )
-
     return result[0]
 
 
@@ -304,7 +297,6 @@ def get_top_tasks(
         """,
         (limit,),
     )
-
     return {
         "count": len(tasks),
         "top_queue": tasks,
@@ -336,7 +328,6 @@ def get_targets():
         ORDER BY tier, platform_name
         """
     )
-
     return {
         "count": len(targets),
         "targets": targets,
