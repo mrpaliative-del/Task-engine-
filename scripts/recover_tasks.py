@@ -1,8 +1,7 @@
-
 #!/usr/bin/env python3
 """
 SolveEase 300-Target Task Engine
-Stale-task recovery utility.
+Stale-task recovery utility (Neon PostgreSQL version).
 
 Examples:
     # Inspect stale tasks without changing anything
@@ -25,24 +24,27 @@ Requeueing such a task can cause duplicate submissions.
 
 import argparse
 import os
-import sqlite3
 import sys
 from pathlib import Path
+import psycopg
+from psycopg.rows import dict_row
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
-DB_ENV = os.getenv("DB_FILE", "task_engine.db")
-DB_PATH = Path(DB_ENV)
-
-if not DB_PATH.is_absolute():
-    DB_PATH = PROJECT_ROOT / DB_PATH
+if not DATABASE_URL:
+    raise RuntimeError(
+        "DATABASE_URL is missing. Configure your Neon connection "
+        "string in the environment before running recovery."
+    )
 
 
 def connect_db():
-    conn = sqlite3.connect(str(DB_PATH), timeout=15)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA busy_timeout = 15000")
-    conn.execute("PRAGMA foreign_keys = ON")
+    conn = psycopg.connect(
+        DATABASE_URL,
+        connect_timeout=15,
+        row_factory=dict_row,
+    )
     return conn
 
 
@@ -69,15 +71,20 @@ def verify_schema(conn):
 
     for table, expected_columns in required.items():
         rows = conn.execute(
-            f"PRAGMA table_info({table})"
+            """
+            SELECT column_name 
+            FROM information_schema.columns 
+            WHERE table_name = %s
+            """,
+            (table,),
         ).fetchall()
 
         if not rows:
             raise RuntimeError(
-                f"Required table '{table}' does not exist."
+                f"Required table '{table}' does not exist in Neon database."
             )
 
-        actual = {row["name"] for row in rows}
+        actual = {row["column_name"] for row in rows}
         missing = expected_columns - actual
 
         if missing:
@@ -88,10 +95,10 @@ def verify_schema(conn):
 
 
 def find_stale_tasks(conn, lease_seconds):
-    # A task is stale only when it has a lock timestamp older than
-    # the configured lease. NULL locks are deliberately not guessed.
-    modifier = f"-{lease_seconds} seconds"
-
+    """
+    A task is stale only when it has a lock timestamp older than
+    the configured lease. NULL locks are deliberately not guessed.
+    """
     return conn.execute(
         """
         SELECT
@@ -106,10 +113,10 @@ def find_stale_tasks(conn, lease_seconds):
         FROM tasks
         WHERE status = 'processing'
           AND locked_at IS NOT NULL
-          AND locked_at <= datetime('now', ?)
+          AND locked_at <= NOW() - (%s * INTERVAL '1 second')
         ORDER BY locked_at ASC, id ASC
         """,
-        (modifier,),
+        (lease_seconds,),
     ).fetchall()
 
 
@@ -117,18 +124,13 @@ def record_event(conn, task_db_id, event_type, details):
     conn.execute(
         """
         INSERT INTO task_events (task_id, event_type, details)
-        VALUES (?, ?, ?)
+        VALUES (%s, %s, %s)
         """,
         (task_db_id, event_type, details[:1000]),
     )
 
 
 def recover(args):
-    if not DB_PATH.is_file():
-        raise FileNotFoundError(
-            f"Database not found: {DB_PATH}"
-        )
-
     conn = connect_db()
 
     try:
@@ -139,7 +141,7 @@ def recover(args):
             args.lease_seconds,
         )
 
-        print(f"Database: {DB_PATH}")
+        print(f"Database: Connected to Neon PostgreSQL")
         print(f"Lease timeout: {args.lease_seconds} seconds")
         print(f"Stale processing tasks: {len(stale_tasks)}")
         print(f"Mode: {'APPLY' if args.apply else 'DRY RUN'}")
@@ -153,7 +155,7 @@ def recover(args):
         manual_review = 0
 
         if args.apply:
-            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("BEGIN")
 
         for task in stale_tasks:
             task_id = task["id"]
@@ -181,9 +183,9 @@ def recover(args):
                     UPDATE tasks
                     SET status = 'failed',
                         locked_at = NULL,
-                        updated_at = CURRENT_TIMESTAMP,
-                        last_error = ?
-                    WHERE id = ? AND status = 'processing'
+                        updated_at = NOW(),
+                        last_error = %s
+                    WHERE id = %s AND status = 'processing'
                     """,
                     (
                         "Stale processing lease; maximum attempts "
@@ -225,10 +227,10 @@ def recover(args):
                 UPDATE tasks
                 SET status = 'pending',
                     locked_at = NULL,
-                    available_at = CURRENT_TIMESTAMP,
-                    updated_at = CURRENT_TIMESTAMP,
-                    last_error = ?
-                WHERE id = ? AND status = 'processing'
+                    available_at = NOW(),
+                    updated_at = NOW(),
+                    last_error = %s
+                WHERE id = %s AND status = 'processing'
                 """,
                 (
                     "Requeued after stale lease; check provider "
@@ -272,7 +274,7 @@ def recover(args):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Inspect and recover stale processing tasks."
+        description="Inspect and recover stale processing tasks in Neon PostgreSQL."
     )
 
     parser.add_argument(
@@ -311,6 +313,6 @@ def parse_args():
 if __name__ == "__main__":
     try:
         recover(parse_args())
-    except (sqlite3.Error, OSError, RuntimeError) as exc:
+    except (psycopg.Error, OSError, RuntimeError) as exc:
         print(f"RECOVERY ERROR: {exc}", file=sys.stderr)
         sys.exit(1)
