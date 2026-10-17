@@ -1,10 +1,24 @@
 
+#!/usr/bin/env python3
+"""
+SolveEase 300-Target Task Engine API
+Neon PostgreSQL edition.
+
+Render start command:
+    uvicorn main:app --host 0.0.0.0 --port $PORT
+
+Required environment variables:
+    DATABASE_URL
+    ENGINE_API_KEY
+"""
+
 import hmac
 import ipaddress
 import os
-import sqlite3
-from contextlib import closing
 from urllib.parse import urlparse
+
+import psycopg
+from psycopg.rows import dict_row
 
 from fastapi import Depends, FastAPI, HTTPException, Query, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -13,14 +27,48 @@ from pydantic import BaseModel, Field, field_validator
 
 app = FastAPI(
     title="SolveEase 300-Target Task Engine API",
-    version="1.1.0",
+    version="1.2.0",
 )
 
-DB_FILE = os.getenv("DB_FILE", "task_engine.db")
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 API_KEY = os.getenv("ENGINE_API_KEY", "").strip()
+
 security = HTTPBearer(auto_error=False)
 
 ALLOWED_METHODS = {"httpx", "playwright", "websocket"}
+
+
+# --------------------------------------------------
+# DATABASE ACCESS
+# --------------------------------------------------
+
+def connect_database():
+    """Open a connection to Neon PostgreSQL."""
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL is not configured.")
+
+    return psycopg.connect(
+        DATABASE_URL,
+        connect_timeout=10,
+        sslmode="require",
+        row_factory=dict_row,
+    )
+
+
+def query_db(sql: str, params=()) -> list[dict]:
+    """Execute a parameterized PostgreSQL query."""
+    try:
+        with connect_database() as conn:
+            rows = conn.execute(sql, params).fetchall()
+            return [dict(row) for row in rows]
+
+    except (psycopg.Error, RuntimeError) as exc:
+        # Log technical details privately in the service logs.
+        print(f"Database query failed: {type(exc).__name__}")
+        raise HTTPException(
+            status_code=503,
+            detail="Database operation failed. Check database configuration.",
+        ) from exc
 
 
 # --------------------------------------------------
@@ -31,8 +79,9 @@ ALLOWED_METHODS = {"httpx", "playwright", "websocket"}
 def root():
     return {
         "service": "SolveEase 300-Target Task Engine API",
-        "version": "1.1.0",
+        "version": "1.2.0",
         "status": "running",
+        "database": "Neon PostgreSQL",
         "health_endpoint": "/api/health",
         "documentation": "/docs",
     }
@@ -52,7 +101,8 @@ def verify_api_key(
         )
 
     if credentials is None or not hmac.compare_digest(
-        credentials.credentials, API_KEY
+        credentials.credentials,
+        API_KEY,
     ):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -61,34 +111,6 @@ def verify_api_key(
         )
 
     return True
-
-
-# --------------------------------------------------
-# DATABASE ACCESS
-# --------------------------------------------------
-
-def query_db(sql, params=()):
-    if not os.path.isfile(DB_FILE):
-        raise HTTPException(
-            status_code=503,
-            detail="Database not found. Initialize schema.sql first.",
-        )
-
-    try:
-        with closing(sqlite3.connect(DB_FILE, timeout=10)) as conn:
-            conn.row_factory = sqlite3.Row
-            conn.execute("PRAGMA busy_timeout = 10000")
-
-            return [
-                dict(row)
-                for row in conn.execute(sql, params).fetchall()
-            ]
-
-    except sqlite3.Error as exc:
-        raise HTTPException(
-            status_code=503,
-            detail="Database operation failed.",
-        ) from exc
 
 
 # --------------------------------------------------
@@ -127,17 +149,24 @@ class TargetRegistration(BaseModel):
     @classmethod
     def validate_endpoint(cls, value):
         value = value.strip()
-        parsed = urlparse(value)
+
+        try:
+            parsed = urlparse(value)
+            hostname = parsed.hostname
+            # Accessing .port also validates malformed port syntax.
+            _ = parsed.port
+        except ValueError as exc:
+            raise ValueError("Endpoint URL is malformed.") from exc
 
         if parsed.scheme not in {"https", "wss"}:
             raise ValueError("Endpoint must use HTTPS or WSS.")
 
-        if not parsed.hostname or parsed.username or parsed.password:
+        if not hostname or parsed.username or parsed.password:
             raise ValueError(
                 "Endpoint must have a hostname and no embedded credentials."
             )
 
-        host = parsed.hostname.lower()
+        host = hostname.lower()
 
         if host in {"localhost", "localhost.localdomain"}:
             raise ValueError("Localhost targets are not permitted.")
@@ -150,7 +179,7 @@ class TargetRegistration(BaseModel):
 
         if address is not None and not address.is_global:
             raise ValueError(
-                "Private or non-public IPs are not permitted."
+                "Private or non-public IP addresses are not permitted."
             )
 
         return value
@@ -162,13 +191,55 @@ class TargetRegistration(BaseModel):
 
 @app.get("/api/health")
 def health():
-    if not os.path.isfile(DB_FILE):
+    """
+    Verify a real database connection.
+    This does not merely check whether the API process is running.
+    """
+    try:
+        with connect_database() as conn:
+            conn.execute("SELECT 1").fetchone()
+
+            tables = conn.execute(
+                """
+                SELECT COUNT(*) AS table_count
+                FROM information_schema.tables
+                WHERE table_schema = current_schema()
+                  AND table_name IN (
+                      'targets',
+                      'tasks',
+                      'task_events'
+                  )
+                  AND table_type = 'BASE TABLE'
+                """
+            ).fetchone()
+
+            if tables["table_count"] != 3:
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        "Database connected, but the required schema "
+                        "is incomplete. Run the database initializer."
+                    ),
+                )
+
+        return {
+            "status": "ok",
+            "database": "connected",
+            "schema": "verified",
+        }
+
+    except HTTPException:
+        raise
+
+    except (psycopg.Error, RuntimeError) as exc:
+        print(f"Health check failed: {type(exc).__name__}")
         raise HTTPException(
             status_code=503,
-            detail="Database unavailable.",
-        )
-
-    return {"status": "ok"}
+            detail=(
+                "Database unavailable. Check DATABASE_URL and "
+                "the Neon database status."
+            ),
+        ) from exc
 
 
 # --------------------------------------------------
@@ -180,11 +251,12 @@ def health():
     dependencies=[Depends(verify_api_key)],
 )
 def get_summary():
-    result = query_db("""
+    result = query_db(
+        """
         SELECT
             (SELECT COUNT(*) FROM targets) AS targets,
             (SELECT COUNT(*) FROM targets
-             WHERE is_active = 1) AS active_targets,
+             WHERE is_active = TRUE) AS active_targets,
             (SELECT COUNT(*) FROM tasks
              WHERE status = 'pending') AS pending,
             (SELECT COUNT(*) FROM tasks
@@ -193,10 +265,15 @@ def get_summary():
              WHERE status = 'completed') AS completed,
             (SELECT COUNT(*) FROM tasks
              WHERE status = 'failed') AS failed
-    """)
+        """
+    )
 
     return result[0]
 
+
+# --------------------------------------------------
+# TOP TASK QUEUE
+# --------------------------------------------------
 
 @app.get(
     "/api/queue/top",
@@ -205,7 +282,8 @@ def get_summary():
 def get_top_tasks(
     limit: int = Query(default=10, ge=1, le=100),
 ):
-    tasks = query_db("""
+    tasks = query_db(
+        """
         SELECT
             task_id,
             source_platform,
@@ -217,13 +295,15 @@ def get_top_tasks(
             created_at
         FROM tasks
         WHERE status = 'pending'
-          AND available_at <= CURRENT_TIMESTAMP
+          AND available_at <= NOW()
         ORDER BY
             roc_score DESC,
             created_at ASC,
             id ASC
-        LIMIT ?
-    """, (limit,))
+        LIMIT %s
+        """,
+        (limit,),
+    )
 
     return {
         "count": len(tasks),
@@ -240,7 +320,8 @@ def get_top_tasks(
     dependencies=[Depends(verify_api_key)],
 )
 def get_targets():
-    targets = query_db("""
+    targets = query_db(
+        """
         SELECT
             platform_name,
             api_endpoint,
@@ -253,7 +334,8 @@ def get_targets():
             cooldown_until
         FROM targets
         ORDER BY tier, platform_name
-    """)
+        """
+    )
 
     return {
         "count": len(targets),
@@ -288,37 +370,32 @@ def register_target(target: TargetRegistration):
             ),
         )
 
-    if not os.path.isfile(DB_FILE):
-        raise HTTPException(
-            status_code=503,
-            detail="Database not found. Initialize schema.sql first.",
-        )
-
     try:
-        with closing(sqlite3.connect(DB_FILE, timeout=10)) as conn:
-            conn.execute("PRAGMA busy_timeout = 10000")
-
-            cursor = conn.execute("""
-                INSERT OR IGNORE INTO targets (
+        with connect_database() as conn:
+            inserted = conn.execute(
+                """
+                INSERT INTO targets (
                     platform_name,
                     api_endpoint,
                     extraction_method,
                     tier,
                     is_active
                 )
-                VALUES (?, ?, ?, ?, 0)
-            """, (
-                target.platform_name,
-                target.api_endpoint,
-                target.extraction_method,
-                target.tier,
-            ))
+                VALUES (%s, %s, %s, %s, FALSE)
+                ON CONFLICT (platform_name) DO NOTHING
+                RETURNING platform_name
+                """,
+                (
+                    target.platform_name,
+                    target.api_endpoint,
+                    target.extraction_method,
+                    target.tier,
+                ),
+            ).fetchone()
 
-            conn.commit()
-
-            if cursor.rowcount == 0:
+            if inserted is None:
                 raise HTTPException(
-                    status_code=409,
+                    status_code=status.HTTP_409_CONFLICT,
                     detail=(
                         "A target with this platform name "
                         "already exists."
@@ -328,10 +405,11 @@ def register_target(target: TargetRegistration):
     except HTTPException:
         raise
 
-    except sqlite3.Error as exc:
+    except (psycopg.Error, RuntimeError) as exc:
+        print(f"Target registration failed: {type(exc).__name__}")
         raise HTTPException(
             status_code=503,
-            detail="Target registration failed.",
+            detail="Target registration failed. Check database configuration.",
         ) from exc
 
     return {
@@ -340,7 +418,7 @@ def register_target(target: TargetRegistration):
         "tier": target.tier,
         "is_active": False,
         "message": (
-            "Registered inactive. Verify the source "
-            "before activation."
+            "Registered inactive. Verify the source and its "
+            "permission for automated access before activation."
         ),
     }
