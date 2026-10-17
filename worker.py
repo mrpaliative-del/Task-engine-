@@ -2,20 +2,36 @@
 import asyncio
 import json
 import logging
+import math
 import os
 import random
-import sqlite3
+import re
 from urllib.parse import urlparse
 
 import httpx
+import psycopg
 import websockets
+from psycopg.rows import dict_row
 
-DB_FILE = os.getenv("DB_FILE", "task_engine.db")
+
+# --------------------------------------------------
+# CONFIGURATION
+# --------------------------------------------------
+
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+
 POLL_INTERVAL = max(5, int(os.getenv("POLL_INTERVAL", "15")))
 REQUEST_TIMEOUT = max(3, int(os.getenv("REQUEST_TIMEOUT", "15")))
+
 EMPTY_POLL_THRESHOLD = 6
 FAILURE_THRESHOLD = 3
 MAX_CONCURRENT_TARGETS = 10
+
+if not DATABASE_URL:
+    raise RuntimeError(
+        "DATABASE_URL is missing. Configure your Neon connection "
+        "string in the worker service environment."
+    )
 
 logging.basicConfig(
     level=logging.INFO,
@@ -24,16 +40,21 @@ logging.basicConfig(
 log = logging.getLogger("task-worker")
 
 
+# --------------------------------------------------
+# NEON POSTGRESQL
+# --------------------------------------------------
+
 def connect_db():
-    conn = sqlite3.connect(DB_FILE, timeout=10)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA busy_timeout = 10000")
-    conn.execute("PRAGMA foreign_keys = ON")
-    return conn
+    """Open a PostgreSQL connection to Neon."""
+    return psycopg.connect(
+        DATABASE_URL,
+        connect_timeout=10,
+        row_factory=dict_row,
+    )
 
 
 def validate_endpoint(url, method):
-    """Accept HTTPS APIs and WSS feeds; reject unsafe schemes."""
+    """Accept approved secure schemes; reject unsafe URL forms."""
     parsed = urlparse(url)
 
     allowed = {
@@ -46,53 +67,102 @@ def validate_endpoint(url, method):
         raise ValueError(f"Unsupported extraction method: {method}")
 
     if parsed.scheme not in allowed[method] or not parsed.hostname:
-        raise ValueError("Endpoint must use an approved secure scheme")
+        raise ValueError(
+            "Endpoint must use an approved secure scheme."
+        )
 
     if parsed.username or parsed.password:
-        raise ValueError("Credentials must not be embedded in URLs")
+        raise ValueError(
+            "Credentials must not be embedded in URLs."
+        )
+
+    if parsed.hostname.lower() in {
+        "localhost",
+        "localhost.localdomain",
+    }:
+        raise ValueError("Localhost targets are not permitted.")
+
+    # Reject private/non-public IP literals.
+    # DNS hostnames need separate DNS and outbound-network validation.
+    import ipaddress
+
+    try:
+        address = ipaddress.ip_address(parsed.hostname)
+    except ValueError:
+        address = None
+
+    if address is not None and not address.is_global:
+        raise ValueError("Non-public IP addresses are not permitted.")
 
     return url
 
 
-def load_targets(tier):
-    with connect_db() as conn:
-        return [
-            dict(row)
-            for row in conn.execute(
-                """
-                SELECT id, platform_name, api_endpoint,
-                       extraction_method, tier,
-                       consecutive_empty_polls,
-                       consecutive_failures
-                FROM targets
-                WHERE tier = ? AND is_active = 1
-                ORDER BY consecutive_failures ASC, id ASC
-                """,
-                (tier,),
-            ).fetchall()
-        ]
+# --------------------------------------------------
+# TARGET MANAGEMENT
+# --------------------------------------------------
 
+def load_targets(tier):
+    """Load active targets whose cooldown has expired."""
+    with connect_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT
+                id,
+                platform_name,
+                api_endpoint,
+                extraction_method,
+                tier,
+                consecutive_empty_polls,
+                consecutive_failures
+            FROM targets
+            WHERE tier = %s
+              AND is_active = TRUE
+              AND (
+                  cooldown_until IS NULL
+                  OR cooldown_until <= NOW()
+              )
+            ORDER BY consecutive_failures ASC, id ASC
+            """,
+            (tier,),
+        ).fetchall()
+
+        return [dict(row) for row in rows]
+
+
+# --------------------------------------------------
+# AUDIT EVENTS
+# --------------------------------------------------
 
 def record_event(conn, task_row_id, event_type, details=None):
     conn.execute(
         """
-        INSERT INTO task_events (task_id, event_type, details)
-        VALUES (?, ?, ?)
+        INSERT INTO task_events (
+            task_id, event_type, details
+        )
+        VALUES (%s, %s, %s)
         """,
         (task_row_id, event_type, details),
     )
 
 
+# --------------------------------------------------
+# TASK NORMALIZATION
+# --------------------------------------------------
+
 def normalize_tasks(data, platform_name):
     """Normalize supported feed shapes and reject invalid records."""
     if isinstance(data, list):
         items = data
+
     elif isinstance(data, dict):
         items = data.get("tasks")
+
         if items is None:
             items = data.get("data", [])
+
         if isinstance(items, dict):
             items = items.get("tasks", [])
+
     else:
         return []
 
@@ -106,30 +176,33 @@ def normalize_tasks(data, platform_name):
             continue
 
         task_id = item.get("id") or item.get("task_id")
+
         if task_id is None or not str(task_id).strip():
-            # Stable IDs are required to deduplicate repeated polls.
+            # Stable IDs prevent repeated polls creating duplicates.
             continue
 
         try:
-            payout = float(item.get("payout_usd", item.get("payout", 0)))
+            payout = float(
+                item.get("payout_usd", item.get("payout", 0))
+            )
             seconds = int(item.get("est_seconds", 30))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             continue
 
-        if payout < 0 or seconds <= 0:
-            continue
-
-        if payout != payout or payout == float("inf"):
+        if not math.isfinite(payout) or payout < 0 or seconds <= 0:
             continue
 
         payload = item.get("payload", {})
+
         if not isinstance(payload, str):
             payload = json.dumps(
-                payload, ensure_ascii=False, default=str
+                payload,
+                ensure_ascii=False,
+                default=str,
             )
 
         result.append({
-            "task_id": f"{platform_name}:{task_id}",
+            "task_id": f"{platform_name}:{str(task_id).strip()}",
             "platform": platform_name,
             "category": str(item.get("category", "general"))[:200],
             "payload": payload,
@@ -140,11 +213,16 @@ def normalize_tasks(data, platform_name):
     return result
 
 
-def auth_headers(platform_name):
-    """Optional bearer token; never store secrets in SQLite."""
-    import re
+# --------------------------------------------------
+# OPTIONAL SOURCE AUTHENTICATION
+# --------------------------------------------------
 
-    slug = re.sub(r"[^A-Za-z0-9]", "_", platform_name).upper()
+def auth_headers(platform_name):
+    """Read optional source tokens from environment variables."""
+    slug = re.sub(
+        r"[^A-Za-z0-9]", "_", platform_name
+    ).upper()
+
     token = os.getenv(f"TARGET_{slug}_TOKEN")
 
     headers = {"Accept": "application/json"}
@@ -155,9 +233,14 @@ def auth_headers(platform_name):
     return headers
 
 
+# --------------------------------------------------
+# HTTPX FEED
+# --------------------------------------------------
+
 async def fetch_httpx(target, client):
     url = validate_endpoint(
-        target["api_endpoint"], target["extraction_method"]
+        target["api_endpoint"],
+        target["extraction_method"],
     )
 
     response = await client.get(
@@ -166,23 +249,35 @@ async def fetch_httpx(target, client):
     )
 
     if response.status_code == 429:
-        raise RuntimeError("Rate limited (HTTP 429)")
+        raise RuntimeError("Source rate-limited the request (HTTP 429).")
 
     response.raise_for_status()
-    return normalize_tasks(response.json(), target["platform_name"])
 
+    return normalize_tasks(
+        response.json(),
+        target["platform_name"],
+    )
+
+
+# --------------------------------------------------
+# PLAYWRIGHT FEED
+# --------------------------------------------------
 
 async def fetch_playwright(target):
-    """Read task data exposed by an authorized page/API response."""
+    """Read JSON responses exposed by an authorized website."""
     from playwright.async_api import async_playwright
 
     url = validate_endpoint(
-        target["api_endpoint"], target["extraction_method"]
+        target["api_endpoint"],
+        target["extraction_method"],
     )
+
     found = []
+    allowed_host = urlparse(url).hostname
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
+
         try:
             context = await browser.new_context()
             page = await context.new_page()
@@ -190,36 +285,58 @@ async def fetch_playwright(target):
             async def on_response(response):
                 if response.status != 200:
                     return
-                if urlparse(response.url).hostname != urlparse(url).hostname:
+
+                if urlparse(response.url).hostname != allowed_host:
                     return
-                if "json" not in response.headers.get("content-type", ""):
+
+                content_type = response.headers.get(
+                    "content-type", ""
+                ).lower()
+
+                if "json" not in content_type:
                     return
 
                 try:
                     data = await response.json()
                     found.extend(
-                        normalize_tasks(data, target["platform_name"])
+                        normalize_tasks(
+                            data,
+                            target["platform_name"],
+                        )
                     )
                 except (ValueError, TypeError):
-                    log.debug("Ignored a non-JSON or unsupported response")
+                    log.debug(
+                        "Ignored unsupported JSON response from %s",
+                        target["platform_name"],
+                    )
 
             page.on("response", on_response)
-            await page.goto(
-                url, wait_until="domcontentloaded",
-                timeout=REQUEST_TIMEOUT * 1000,
-            )
-            await page.wait_for_timeout(1500)
-            await page.remove_listener("response", on_response)
+
+            try:
+                await page.goto(
+                    url,
+                    wait_until="domcontentloaded",
+                    timeout=REQUEST_TIMEOUT * 1000,
+                )
+                await page.wait_for_timeout(1500)
+            finally:
+                page.remove_listener("response", on_response)
+
         finally:
             await browser.close()
 
     return found
 
 
+# --------------------------------------------------
+# WEBSOCKET FEED
+# --------------------------------------------------
+
 async def fetch_websocket(target):
-    """Read one message from an authorized WSS task feed."""
+    """Read one message from an authorized WSS feed."""
     url = validate_endpoint(
-        target["api_endpoint"], target["extraction_method"]
+        target["api_endpoint"],
+        target["extraction_method"],
     )
 
     headers = auth_headers(target["platform_name"])
@@ -234,27 +351,45 @@ async def fetch_websocket(target):
     ) as ws:
         try:
             message = await asyncio.wait_for(
-                ws.recv(), timeout=REQUEST_TIMEOUT
+                ws.recv(),
+                timeout=REQUEST_TIMEOUT,
             )
         except asyncio.TimeoutError:
             return []
 
     data = json.loads(message)
-    return normalize_tasks(data, target["platform_name"])
 
+    return normalize_tasks(
+        data,
+        target["platform_name"],
+    )
+
+
+# --------------------------------------------------
+# SAVE AND DEDUPLICATE TASKS
+# --------------------------------------------------
 
 def save_tasks(target, tasks):
+    """Insert new tasks and audit events in one transaction."""
     inserted = 0
 
     with connect_db() as conn:
         for task in tasks:
-            cursor = conn.execute(
+            row = conn.execute(
                 """
-                INSERT OR IGNORE INTO tasks (
-                    task_id, source_target_id, source_platform,
-                    category, payload, payout_usd, est_seconds, status
+                INSERT INTO tasks (
+                    task_id,
+                    source_target_id,
+                    source_platform,
+                    category,
+                    payload,
+                    payout_usd,
+                    est_seconds,
+                    status
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')
+                VALUES (%s, %s, %s, %s, %s, %s, %s, 'pending')
+                ON CONFLICT (task_id) DO NOTHING
+                RETURNING id
                 """,
                 (
                     task["task_id"],
@@ -265,30 +400,44 @@ def save_tasks(target, tasks):
                     task["payout"],
                     task["seconds"],
                 ),
+            ).fetchone()
+
+            if row is None:
+                continue
+
+            inserted += 1
+
+            record_event(
+                conn,
+                row["id"],
+                "ingested",
+                f"Source tier {target['tier']}",
             )
 
-            if cursor.rowcount:
-                inserted += 1
-                task_row_id = cursor.lastrowid
-                record_event(
-                    conn, task_row_id, "ingested",
-                    f"Source tier {target['tier']}",
-                )
-
+        # Reset the empty-poll counter if new tasks were added.
+        # Otherwise, increment it instead of repeatedly setting it to 1.
         conn.execute(
             """
             UPDATE targets
-            SET consecutive_empty_polls = ?,
+            SET consecutive_empty_polls =
+                    CASE
+                        WHEN %s > 0 THEN 0
+                        ELSE consecutive_empty_polls + 1
+                    END,
                 consecutive_failures = 0,
-                last_checked = CURRENT_TIMESTAMP,
+                last_checked = NOW(),
                 cooldown_until = NULL
-            WHERE id = ?
+            WHERE id = %s
             """,
-            (0 if inserted else 1, target["id"]),
+            (inserted, target["id"]),
         )
 
     return inserted
 
+
+# --------------------------------------------------
+# FAILURE TRACKING
+# --------------------------------------------------
 
 def record_failure(target, error):
     with connect_db() as conn:
@@ -296,13 +445,13 @@ def record_failure(target, error):
             """
             UPDATE targets
             SET consecutive_failures = consecutive_failures + 1,
-                last_checked = CURRENT_TIMESTAMP,
+                last_checked = NOW(),
                 cooldown_until = CASE
-                    WHEN consecutive_failures + 1 >= ?
-                    THEN datetime('now', '+60 seconds')
+                    WHEN consecutive_failures + 1 >= %s
+                    THEN NOW() + INTERVAL '60 seconds'
                     ELSE cooldown_until
                 END
-            WHERE id = ?
+            WHERE id = %s
             """,
             (FAILURE_THRESHOLD, target["id"]),
         )
@@ -314,6 +463,10 @@ def record_failure(target, error):
     )
 
 
+# --------------------------------------------------
+# POLLING
+# --------------------------------------------------
+
 async def poll_target(target, client, semaphore):
     async with semaphore:
         try:
@@ -321,74 +474,107 @@ async def poll_target(target, client, semaphore):
 
             if method == "httpx":
                 tasks = await fetch_httpx(target, client)
+
             elif method == "playwright":
                 tasks = await fetch_playwright(target)
+
             elif method == "websocket":
                 tasks = await fetch_websocket(target)
+
             else:
-                raise ValueError(f"Unsupported method: {method}")
+                raise ValueError(
+                    f"Unsupported extraction method: {method}"
+                )
 
             inserted = save_tasks(target, tasks)
+
             log.info(
                 "[%s] Received %d; inserted %d new tasks",
-                target["platform_name"], len(tasks), inserted,
+                target["platform_name"],
+                len(tasks),
+                inserted,
             )
 
         except Exception as exc:
-            record_failure(target, exc)
+            try:
+                record_failure(target, exc)
+            except Exception:
+                log.exception(
+                    "[%s] Could not record source failure",
+                    target["platform_name"],
+                )
 
+
+# --------------------------------------------------
+# SMART FAILOVER
+# --------------------------------------------------
 
 def choose_tier(primary):
-    """Use backup when all active primary feeds are dry or failing."""
+    """Use backups when all eligible primary sources are unhealthy."""
     if not primary:
         return 2
 
     primary_unhealthy = all(
-        t["consecutive_empty_polls"] >= EMPTY_POLL_THRESHOLD
-        or t["consecutive_failures"] >= FAILURE_THRESHOLD
-        for t in primary
+        target["consecutive_empty_polls"] >= EMPTY_POLL_THRESHOLD
+        or target["consecutive_failures"] >= FAILURE_THRESHOLD
+        for target in primary
     )
 
     return 2 if primary_unhealthy else 1
 
 
 async def run_smart_failover_engine():
-    log.info("Task ingestion worker starting")
+    log.info("SolveEase task ingestion worker starting")
 
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_TARGETS)
+
     limits = httpx.Limits(
         max_connections=MAX_CONCURRENT_TARGETS,
         max_keepalive_connections=MAX_CONCURRENT_TARGETS,
     )
 
+    timeout = httpx.Timeout(REQUEST_TIMEOUT)
+
     async with httpx.AsyncClient(
-        timeout=REQUEST_TIMEOUT,
+        timeout=timeout,
         limits=limits,
         follow_redirects=False,
     ) as client:
+
         while True:
             try:
                 primary = load_targets(1)
                 tier = choose_tier(primary)
                 targets = load_targets(tier)
 
+                # If no backup source is available, return to primary
+                # sources that remain active and outside cooldown.
                 if not targets and tier == 2:
                     targets = primary
                     tier = 1
 
-                log.info("Polling tier %d (%d targets)", tier, len(targets))
+                log.info(
+                    "Polling tier %d (%d eligible targets)",
+                    tier,
+                    len(targets),
+                )
 
                 await asyncio.gather(*(
-                    poll_target(t, client, semaphore)
-                    for t in targets
+                    poll_target(target, client, semaphore)
+                    for target in targets
                 ))
 
-            except sqlite3.Error:
-                log.exception("Database error in polling loop")
+            except psycopg.Error:
+                log.exception(
+                    "Neon PostgreSQL error in polling loop"
+                )
+
             except Exception:
                 log.exception("Unexpected worker-loop error")
 
-            await asyncio.sleep(POLL_INTERVAL + random.uniform(0, 2))
+            await asyncio.sleep(
+                POLL_INTERVAL + random.uniform(0, 2)
+            )
 
 
 if __name__ == "__main__":
