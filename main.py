@@ -1,445 +1,359 @@
 
-#!/usr/bin/env python3
-"""
-SolveEase 300-Target Task Engine API
-Neon PostgreSQL + background scanner + Telegram monitoring.
-
-Render start command:
-    uvicorn main:app --host 0.0.0.0 --port $PORT
-
-Required:
-    DATABASE_URL
-    ENGINE_API_KEY
-
-Optional:
-    TELEGRAM_BOT_TOKEN
-    TELEGRAM_CHAT_ID
-    SCAN_INTERVAL_SECONDS=900
-    REQUEST_TIMEOUT_SECONDS=15
-
-Task execution remains in consumer.py. This API never marks a task
-completed merely because it was discovered or placed in a queue.
-"""
-
-import asyncio
 import hashlib
-import hmac
 import ipaddress
 import json
 import logging
 import math
 import os
-from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+import socket
+from contextlib import closing
+from decimal import Decimal, InvalidOperation
+from pathlib import Path
 from urllib.parse import urlparse
 
 import httpx
 import psycopg
 from psycopg.rows import dict_row
-
-from fastapi import Depends, FastAPI, HTTPException, Query, status
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from fastapi import Body, Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field, field_validator
 
 
-# ==================================================
-# CONFIGURATION
-# ==================================================
+# ============================================================
+# SolveEase 300-Target Task Engine
+# Version 2.0.0 — Neon PostgreSQL
+#
+# API manages targets, queue visibility and manual feed scans.
+# worker.py owns continuous feed polling.
+# consumer.py owns task execution.
+# ============================================================
+
+APP_NAME = "SolveEase 300-Target Task Engine"
+APP_VERSION = "2.0.0"
+
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+ENGINE_API_KEY = os.getenv("ENGINE_API_KEY", "").strip()
+
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+
+AUTO_SEED_TARGETS = os.getenv("AUTO_SEED_TARGETS", "false").lower() == "true"
+ENABLE_API_BACKGROUND_SCANNER = (
+    os.getenv("ENABLE_API_BACKGROUND_SCANNER", "false").lower() == "true"
+)
+
+SCAN_TIMEOUT_SECONDS = float(os.getenv("SCAN_TIMEOUT_SECONDS", "15"))
+MAX_TASKS_PER_TARGET = int(os.getenv("MAX_TASKS_PER_TARGET", "100"))
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
-logger = logging.getLogger("solveease.engine")
+logger = logging.getLogger("solveease.main")
 
-DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
-API_KEY = os.getenv("ENGINE_API_KEY", "").strip()
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-
-SCAN_INTERVAL_SECONDS = max(
-    60, int(os.getenv("SCAN_INTERVAL_SECONDS", "900"))
-)
-REQUEST_TIMEOUT_SECONDS = max(
-    3, min(60, int(os.getenv("REQUEST_TIMEOUT_SECONDS", "15")))
+app = FastAPI(
+    title=APP_NAME,
+    version=APP_VERSION,
+    description="Target management and task queue API.",
 )
 
-ALLOWED_METHODS = {"httpx", "playwright", "websocket"}
-MAX_RESPONSE_BYTES = 2_000_000
-MAX_BULK_TARGETS = 100
 
-security = HTTPBearer(auto_error=False)
-
-
-# ==================================================
+# ============================================================
 # DATABASE
-# ==================================================
+# ============================================================
 
 def connect_database():
     if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL is not configured.")
+        raise RuntimeError("DATABASE_URL is not configured")
 
     return psycopg.connect(
         DATABASE_URL,
         connect_timeout=10,
-        sslmode="require",
         row_factory=dict_row,
     )
 
 
-def query_db(sql: str, params=()):
+def database_error(operation: str, exc: Exception):
+    # Log the exception internally. Never return connection strings
+    # or raw database exception details to API callers.
+    logger.error("%s failed: %s", operation, type(exc).__name__)
+
+
+def require_database():
     try:
-        with connect_database() as conn:
-            return [
-                dict(row)
-                for row in conn.execute(sql, params).fetchall()
-            ]
-    except (psycopg.Error, RuntimeError) as exc:
-        logger.error("Database query failed: %s", type(exc).__name__)
+        with closing(connect_database()) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+                cur.fetchone()
+    except Exception as exc:
+        database_error("Database availability check", exc)
         raise HTTPException(
             status_code=503,
-            detail="Database operation failed.",
-        ) from exc
+            detail="Database unavailable. Check DATABASE_URL and Neon status.",
+        ) from None
 
 
-def record_event(conn, task_id: int, event_type: str, details: str = ""):
-    conn.execute(
-        """
-        INSERT INTO task_events (task_id, event_type, details)
-        VALUES (%s, %s, %s)
-        """,
-        (task_id, event_type, details[:2000]),
-    )
-
-
-# ==================================================
-# TELEGRAM
-# ==================================================
-
-def send_telegram_alert(message: str):
-    """Send a best-effort Telegram alert without exposing bot credentials."""
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        logger.info("Telegram not configured; alert: %s", message[:500])
-        return False
-
-    url = (
-        f"https://api.telegram.org/bot"
-        f"{TELEGRAM_BOT_TOKEN}/sendMessage"
-    )
-
-    try:
-        with httpx.Client(timeout=10) as client:
-            response = client.post(
-                url,
-                json={
-                    "chat_id": TELEGRAM_CHAT_ID,
-                    "text": message[:4000],
-                },
-            )
-            response.raise_for_status()
-
-            body = response.json()
-            if not body.get("ok"):
-                logger.warning("Telegram rejected an alert.")
-                return False
-
-            return True
-
-    except Exception as exc:
-        logger.warning("Telegram delivery failed: %s", type(exc).__name__)
-        return False
-
-
-# ==================================================
+# ============================================================
 # AUTHENTICATION
-# ==================================================
+# Supports X-API-Key or Authorization: Bearer <key>
+# ============================================================
 
 def verify_api_key(
-    credentials: HTTPAuthorizationCredentials | None = Depends(security),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    authorization: str | None = Header(default=None, alias="Authorization"),
 ):
-    if not API_KEY:
+    import hmac
+
+    if not ENGINE_API_KEY:
         raise HTTPException(
             status_code=503,
-            detail="ENGINE_API_KEY is not configured.",
+            detail="API authentication is not configured.",
         )
 
-    if credentials is None or not hmac.compare_digest(
-        credentials.credentials, API_KEY
-    ):
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid or missing API key.",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
+    supplied = x_api_key or ""
+
+    if authorization and authorization.lower().startswith("bearer "):
+        supplied = authorization[7:].strip()
+
+    if not supplied or not hmac.compare_digest(supplied, ENGINE_API_KEY):
+        raise HTTPException(status_code=401, detail="Invalid or missing API key.")
 
     return True
 
 
-# ==================================================
-# TARGET VALIDATION
-# ==================================================
+# ============================================================
+# INPUT VALIDATION
+# ============================================================
 
-def validate_target_values(
-    platform_name: str,
-    endpoint: str,
-    method: str,
-    tier: int,
-):
-    name = platform_name.strip()
-    endpoint = endpoint.strip()
-    method = method.strip().lower()
+def validate_endpoint_url(value: str, method: str) -> str:
+    value = value.strip()
+    parsed = urlparse(value)
 
-    if not 2 <= len(name) <= 100:
-        raise ValueError("Platform name must be 2–100 characters.")
+    allowed_scheme = "wss" if method == "websocket" else "https"
 
-    if method not in ALLOWED_METHODS:
-        raise ValueError("Unsupported extraction method.")
+    if parsed.scheme.lower() != allowed_scheme:
+        raise ValueError(f"{method} targets must use {allowed_scheme}://")
 
-    if tier not in (1, 2):
-        raise ValueError("Tier must be 1 or 2.")
+    if not parsed.hostname:
+        raise ValueError("Endpoint must include a hostname")
+
+    if parsed.username or parsed.password:
+        raise ValueError("Credentials must not be embedded in endpoint URLs")
+
+    if parsed.fragment:
+        raise ValueError("Endpoint URLs must not contain fragments")
+
+    host = parsed.hostname.lower().rstrip(".")
+
+    if host in {"localhost", "localhost.localdomain"}:
+        raise ValueError("Localhost endpoints are not allowed")
 
     try:
-        parsed = urlparse(endpoint)
-        hostname = parsed.hostname
-        _ = parsed.port
+        ip = ipaddress.ip_address(host)
+        if not ip.is_global:
+            raise ValueError("Private, loopback and reserved IPs are not allowed")
     except ValueError as exc:
-        raise ValueError("Malformed endpoint URL.") from exc
+        if "not allowed" in str(exc):
+            raise
+        # A normal DNS hostname is not an IP literal.
+        if ":" in host:
+            raise ValueError("Invalid endpoint hostname") from None
 
-    if parsed.scheme not in {"https", "wss"}:
-        raise ValueError("Target must use HTTPS or WSS.")
-
-    expected_scheme = "wss" if method == "websocket" else "https"
-    if parsed.scheme != expected_scheme:
-        raise ValueError(f"{method} requires {expected_scheme}://")
-
-    if (
-        not hostname
-        or parsed.username
-        or parsed.password
-        or parsed.fragment
-    ):
-        raise ValueError(
-            "Endpoint must have a hostname, no embedded credentials, "
-            "and no fragment."
-        )
-
-    if hostname.lower() in {"localhost", "localhost.localdomain"}:
-        raise ValueError("Localhost targets are not permitted.")
-
-    try:
-        address = ipaddress.ip_address(hostname)
-    except ValueError:
-        address = None
-
-    if address is not None and not address.is_global:
-        raise ValueError("Non-public IP addresses are not permitted.")
-
-    return name, endpoint, method, tier
+    return value
 
 
 class TargetRegistration(BaseModel):
-    platform_name: str = Field(min_length=2, max_length=100)
-    api_endpoint: str = Field(min_length=8, max_length=2048)
-    extraction_method: str
-    tier: int = Field(default=1, ge=1, le=2)
+    platform_name: str = Field(min_length=2, max_length=120)
+    api_endpoint: str = Field(min_length=8, max_length=2000)
+    extraction_method: str = "httpx"
+    tier: int = Field(default=2, ge=1, le=2)
+    is_active: bool = False
 
     @field_validator("platform_name")
     @classmethod
-    def clean_name(cls, value):
+    def clean_platform_name(cls, value):
         value = value.strip()
         if not value:
-            raise ValueError("Platform name cannot be empty.")
+            raise ValueError("platform_name cannot be blank")
         return value
 
     @field_validator("extraction_method")
     @classmethod
-    def clean_method(cls, value):
+    def check_method(cls, value):
         value = value.strip().lower()
-        if value not in ALLOWED_METHODS:
-            raise ValueError("Method must be httpx, playwright, or websocket.")
+        if value not in {"httpx", "playwright", "websocket"}:
+            raise ValueError("Use httpx, playwright or websocket")
         return value
 
     @field_validator("api_endpoint")
     @classmethod
-    def clean_endpoint(cls, value):
-        value = value.strip()
-        try:
-            parsed = urlparse(value)
-            hostname = parsed.hostname
-            _ = parsed.port
-        except ValueError as exc:
-            raise ValueError("Malformed endpoint URL.") from exc
-
-        if parsed.scheme not in {"https", "wss"}:
-            raise ValueError("Endpoint must use HTTPS or WSS.")
-        if not hostname or parsed.username or parsed.password:
-            raise ValueError("Endpoint hostname is invalid.")
-        if parsed.fragment:
-            raise ValueError("URL fragments are not permitted.")
-
-        if hostname.lower() in {"localhost", "localhost.localdomain"}:
-            raise ValueError("Localhost targets are not permitted.")
-
-        try:
-            address = ipaddress.ip_address(hostname)
-        except ValueError:
-            address = None
-
-        if address is not None and not address.is_global:
-            raise ValueError("Non-public IP addresses are not permitted.")
-
-        return value
+    def check_endpoint(cls, value, info):
+        # The extraction method may not yet have been validated.
+        method = info.data.get("extraction_method", "httpx")
+        return validate_endpoint_url(value, method)
 
 
 class TargetStatusUpdate(BaseModel):
     is_active: bool
 
 
-# ==================================================
-# FEED PARSING
-# ==================================================
+# ============================================================
+# TELEGRAM NOTIFICATIONS
+# ============================================================
 
-def parse_feed_payload(data):
-    """
-    Accepted feed formats:
-      - a JSON list of task objects
-      - {"tasks": [...]}
-      - {"data": [...]}
+def send_telegram_alert(message: str) -> bool:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        logger.info("Telegram not configured; alert skipped.")
+        return False
 
-    Each task needs a stable task_id or id, payout_usd and est_seconds.
-    """
+    url = (
+        "https://api.telegram.org/bot"
+        + TELEGRAM_BOT_TOKEN
+        + "/sendMessage"
+    )
+
+    try:
+        with httpx.Client(timeout=10.0) as client:
+            response = client.post(
+                url,
+                json={
+                    "chat_id": TELEGRAM_CHAT_ID,
+                    "text": message[:3500],
+                },
+            )
+            response.raise_for_status()
+
+        return True
+    except Exception as exc:
+        logger.warning("Telegram notification failed: %s", type(exc).__name__)
+        return False
+
+
+# ============================================================
+# SAFE FEED PARSING
+# The manual API scan supports HTTPX JSON feeds only.
+# Continuous scanning belongs to worker.py.
+# ============================================================
+
+def extract_task_list(data):
     if isinstance(data, list):
         items = data
     elif isinstance(data, dict):
-        items = data.get("tasks", data.get("data", []))
+        items = data.get("tasks")
+        if items is None:
+            items = data.get("data")
+        if items is None:
+            items = data.get("results")
     else:
-        raise ValueError("Feed root must be a JSON list or object.")
+        return []
 
     if not isinstance(items, list):
-        raise ValueError("'tasks' or 'data' must be a list.")
+        return []
 
-    valid = []
-
-    for item in items[:1000]:
-        if not isinstance(item, dict):
-            continue
-
-        source_id = item.get("task_id", item.get("id"))
-        if source_id is None or not str(source_id).strip():
-            # Never invent an unstable ID for a real opportunity.
-            continue
-
-        try:
-            payout = float(item.get("payout_usd"))
-            seconds = int(item.get("est_seconds"))
-        except (TypeError, ValueError, OverflowError):
-            continue
-
-        if not math.isfinite(payout) or payout < 0 or seconds <= 0:
-            continue
-
-        category = str(item.get("category", "General"))[:200]
-        task_id = str(source_id).strip()[:300]
-        payload = json.dumps(item, ensure_ascii=False, separators=(",", ":"))
-
-        valid.append({
-            "source_id": task_id,
-            "category": category,
-            "payout_usd": payout,
-            "est_seconds": seconds,
-            "payload": payload,
-        })
-
-    return valid
+    return [item for item in items[:MAX_TASKS_PER_TARGET]
+            if isinstance(item, dict)]
 
 
-def fetch_target_items(target):
+def normalize_task(item: dict, platform_name: str):
+    payout_value = item.get("payout_usd", item.get("payout", 0))
+    seconds_value = item.get(
+        "est_seconds",
+        item.get("estimated_seconds", item.get("duration_seconds", 0)),
+    )
+
+    try:
+        payout = Decimal(str(payout_value))
+        seconds_decimal = Decimal(str(seconds_value))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+
+    if not payout.is_finite() or payout < 0:
+        return None
+
+    if not seconds_decimal.is_finite():
+        return None
+
+    if seconds_decimal <= 0 or seconds_decimal != seconds_decimal.to_integral_value():
+        return None
+
+    seconds = int(seconds_decimal)
+    if seconds > 2_147_483_647:
+        return None
+
+    external_id = item.get("task_id") or item.get("id")
+    canonical = json.dumps(
+        item,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        default=str,
+    )
+
+    if external_id is None:
+        identity = canonical
+    else:
+        identity = str(external_id)
+
+    digest = hashlib.sha256(
+        f"{platform_name}:{identity}".encode("utf-8")
+    ).hexdigest()
+
+    task_id = f"se-{digest[:48]}"
+    category = str(item.get("category", "general"))[:120]
+
+    return {
+        "task_id": task_id,
+        "category": category,
+        "payload": canonical,
+        "payout_usd": payout,
+        "est_seconds": seconds,
+    }
+
+
+def scan_one_target(target: dict) -> dict:
     """
-    Fetch only feeds using the documented JSON format.
-    Unsupported extraction methods are reported, not silently treated
-    as successful scans.
+    Poll one HTTPX JSON target.
+    Each target gets its own transaction, so one failure does not
+    roll back other targets.
     """
-    method = target["extraction_method"]
-    endpoint = target["api_endpoint"]
+    if target["extraction_method"] != "httpx":
+        return {
+            "platform": target["platform_name"],
+            "status": "skipped",
+            "reason": "This API scan supports httpx targets only; use worker.py for other methods.",
+            "inserted": 0,
+        }
 
-    if method != "httpx":
-        raise ValueError(
-            f"{method} extraction is not implemented in this scanner. "
-            "Use a compatible JSON HTTPS feed or implement a dedicated adapter."
-        )
+    endpoint = validate_endpoint_url(
+        target["api_endpoint"],
+        target["extraction_method"],
+    )
 
-    with httpx.Client(
-        timeout=REQUEST_TIMEOUT_SECONDS,
-        follow_redirects=False,
-        headers={"Accept": "application/json"},
-    ) as client:
-        with client.stream("GET", endpoint) as response:
+    try:
+        # Do not automatically follow redirects to an unvalidated host.
+        with httpx.Client(
+            timeout=SCAN_TIMEOUT_SECONDS,
+            follow_redirects=False,
+            headers={"Accept": "application/json", "User-Agent": "SolveEaseTaskEngine/2.0"},
+        ) as client:
+            response = client.get(endpoint)
             response.raise_for_status()
+            data = response.json()
 
-            content_type = response.headers.get("content-type", "").lower()
-            if "json" not in content_type:
-                raise ValueError("Feed did not return a JSON content type.")
+        items = extract_task_list(data)
+        inserted = 0
+        invalid = 0
 
-            chunks = []
-            total_bytes = 0
-
-            for chunk in response.iter_bytes():
-                total_bytes += len(chunk)
-                if total_bytes > MAX_RESPONSE_BYTES:
-                    raise ValueError("Feed response exceeded the size limit.")
-                chunks.append(chunk)
-
-            data = json.loads(b"".join(chunks).decode("utf-8"))
-
-    return parse_feed_payload(data)
-
-
-# ==================================================
-# ENGINE SCAN
-# ==================================================
-
-def execute_engine_scan_cycle() -> dict:
-    """
-    Scan active targets and insert newly discovered tasks.
-
-    The generated roc_score column is computed by PostgreSQL.
-    Task discovery is not task execution or confirmed revenue.
-    """
-    scanned = 0
-    discovered = 0
-    errors = []
-
-    with connect_database() as conn:
-        targets = conn.execute(
-            """
-            SELECT id, platform_name, api_endpoint, extraction_method, tier
-            FROM targets
-            WHERE is_active = TRUE
-              AND (cooldown_until IS NULL OR cooldown_until <= NOW())
-            ORDER BY tier, consecutive_failures, platform_name
-            """
-        ).fetchall()
-
-        for target in targets:
-            scanned += 1
-            name = target["platform_name"]
-
-            try:
-                items = fetch_target_items(target)
-                inserted_count = 0
-
-                # Each target has its own transaction boundary. A failed
-                # feed does not undo previously committed target results.
-                with conn.transaction():
+        with closing(connect_database()) as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
                     for item in items:
-                        # Stable, namespaced identifier across restarts.
-                        stable_id = hashlib.sha256(
-                            f"{name}\0{item['source_id']}".encode("utf-8")
-                        ).hexdigest()
+                        normalized = normalize_task(item, target["platform_name"])
 
-                        task_id = f"{name}:{stable_id}"
+                        if normalized is None:
+                            invalid += 1
+                            continue
 
-                        row = conn.execute(
+                        cur.execute(
                             """
                             INSERT INTO tasks (
                                 task_id,
@@ -448,38 +362,43 @@ def execute_engine_scan_cycle() -> dict:
                                 category,
                                 payload,
                                 payout_usd,
-                                est_seconds,
-                                status,
-                                available_at
+                                est_seconds
                             )
-                            VALUES (
-                                %s, %s, %s, %s, %s, %s, %s,
-                                'pending', NOW()
-                            )
+                            VALUES (%s, %s, %s, %s, %s, %s, %s)
                             ON CONFLICT (task_id) DO NOTHING
                             RETURNING id
                             """,
                             (
-                                task_id,
+                                normalized["task_id"],
                                 target["id"],
-                                name,
-                                item["category"],
-                                item["payload"],
-                                item["payout_usd"],
-                                item["est_seconds"],
+                                target["platform_name"],
+                                normalized["category"],
+                                normalized["payload"],
+                                normalized["payout_usd"],
+                                normalized["est_seconds"],
                             ),
-                        ).fetchone()
+                        )
 
+                        row = cur.fetchone()
                         if row:
-                            inserted_count += 1
-                            record_event(
-                                conn,
-                                row["id"],
-                                "discovered",
-                                f"Discovered from {name}",
+                            inserted += 1
+                            cur.execute(
+                                """
+                                INSERT INTO task_events
+                                    (task_id, event_type, details)
+                                VALUES (%s, %s, %s)
+                                """,
+                                (
+                                    row["id"],
+                                    "discovered",
+                                    json.dumps({
+                                        "source": target["platform_name"],
+                                        "category": normalized["category"],
+                                    }),
+                                ),
                             )
 
-                    conn.execute(
+                    cur.execute(
                         """
                         UPDATE targets
                         SET last_checked = NOW(),
@@ -487,434 +406,463 @@ def execute_engine_scan_cycle() -> dict:
                             consecutive_empty_polls =
                                 CASE WHEN %s = 0
                                      THEN consecutive_empty_polls + 1
-                                     ELSE 0 END,
-                            cooldown_until = NULL
+                                     ELSE 0 END
                         WHERE id = %s
                         """,
-                        (inserted_count, target["id"]),
+                        (len(items), target["id"]),
                     )
 
-                discovered += inserted_count
+        return {
+            "platform": target["platform_name"],
+            "status": "ok",
+            "received": len(items),
+            "inserted": inserted,
+            "invalid": invalid,
+        }
 
-            except Exception as exc:
-                error_type = type(exc).__name__
-                logger.warning(
-                    "Scan failed for target %s (%s)",
-                    name,
-                    error_type,
-                )
+    except Exception as exc:
+        database_error(f"Scan for {target['platform_name']}", exc)
 
-                errors.append({
-                    "platform_name": name,
-                    "error_type": error_type,
-                })
-
-                # Keep the error detail out of public API responses.
-                try:
-                    with conn.transaction():
-                        conn.execute(
+        try:
+            with closing(connect_database()) as conn:
+                with conn.transaction():
+                    with conn.cursor() as cur:
+                        cur.execute(
                             """
                             UPDATE targets
-                            SET consecutive_failures = consecutive_failures + 1,
-                                last_checked = NOW(),
-                                cooldown_until =
-                                    CASE
-                                        WHEN consecutive_failures + 1 >= 3
-                                        THEN NOW() + INTERVAL '5 minutes'
-                                        ELSE cooldown_until
-                                    END
+                            SET last_checked = NOW(),
+                                consecutive_failures =
+                                    consecutive_failures + 1
                             WHERE id = %s
                             """,
                             (target["id"],),
                         )
-                except psycopg.Error:
-                    logger.exception(
-                        "Could not record failure for target %s", name
-                    )
+        except Exception as update_exc:
+            database_error("Target failure counter update", update_exc)
 
-    report = (
-        "SolveEase Scan Report\n"
-        f"Active targets scanned: {scanned}\n"
-        f"New tasks discovered: {discovered}\n"
-        f"Target errors: {len(errors)}\n"
-        "Note: discovered tasks are not confirmed earnings."
-    )
+        return {
+            "platform": target["platform_name"],
+            "status": "error",
+            "reason": "Feed scan failed. Check server logs and target configuration.",
+            "inserted": 0,
+        }
 
-    send_telegram_alert(report)
+
+def execute_engine_scan_cycle():
+    require_database()
+
+    with closing(connect_database()) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, platform_name, api_endpoint, extraction_method, tier
+                FROM targets
+                WHERE is_active = TRUE
+                ORDER BY tier ASC, id ASC
+                """
+            )
+            targets = cur.fetchall()
+
+    results = []
+    for target in targets:
+        results.append(scan_one_target(target))
+
+    inserted_total = sum(item.get("inserted", 0) for item in results)
 
     return {
-        "status": "completed" if not errors else "completed_with_errors",
-        "scanned_targets": scanned,
-        "tasks_discovered": discovered,
-        "errors": errors,
+        "targets_checked": len(results),
+        "tasks_inserted": inserted_total,
+        "results": results,
     }
 
 
-# ==================================================
-# LIFESPAN / BACKGROUND SCANNER
-# ==================================================
+# ============================================================
+# OPTIONAL SAFE SEEDING
+# AUTO_SEED_TARGETS defaults to false.
+# Seeded records are always inactive.
+# ============================================================
 
-async def background_scanning_loop():
-    await asyncio.sleep(15)
+def seed_targets_if_enabled():
+    if not AUTO_SEED_TARGETS:
+        logger.info("Automatic target seeding disabled.")
+        return
 
-    while True:
-        try:
-            logger.info("Starting scheduled feed scan.")
-            result = await asyncio.to_thread(execute_engine_scan_cycle)
-            logger.info(
-                "Scan complete: scanned=%s discovered=%s errors=%s",
-                result["scanned_targets"],
-                result["tasks_discovered"],
-                len(result["errors"]),
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception("Background scan failed.")
-
-        await asyncio.sleep(SCAN_INTERVAL_SECONDS)
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    logger.info("Starting SolveEase API.")
-
-    app.state.scanner_task = asyncio.create_task(
-        background_scanning_loop()
-    )
+    path = Path("targets_300.json")
+    if not path.exists():
+        logger.info("targets_300.json not found; seeding skipped.")
+        return
 
     try:
-        yield
-    finally:
-        app.state.scanner_task.cancel()
-        try:
-            await app.state.scanner_task
-        except asyncio.CancelledError:
-            pass
-        logger.info("SolveEase API shutdown complete.")
+        with path.open("r", encoding="utf-8") as file:
+            data = json.load(file)
+
+        if isinstance(data, dict):
+            data = data.get("targets", [])
+
+        if not isinstance(data, list):
+            raise ValueError("Seed JSON must contain a list of targets")
+
+        valid_targets = []
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+
+            model = TargetRegistration(
+                platform_name=item.get("platform_name", ""),
+                api_endpoint=item.get("api_endpoint", ""),
+                extraction_method=item.get("extraction_method", "httpx"),
+                tier=item.get("tier", 2),
+                is_active=False,
+            )
+            valid_targets.append(model)
+
+        with closing(connect_database()) as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    for target in valid_targets:
+                        cur.execute(
+                            """
+                            INSERT INTO targets (
+                                platform_name,
+                                api_endpoint,
+                                extraction_method,
+                                tier,
+                                is_active
+                            )
+                            VALUES (%s, %s, %s, %s, FALSE)
+                            ON CONFLICT (platform_name) DO NOTHING
+                            """,
+                            (
+                                target.platform_name,
+                                target.api_endpoint,
+                                target.extraction_method,
+                                target.tier,
+                            ),
+                        )
+
+        logger.info("Target seeding completed; valid entries: %s", len(valid_targets))
+
+    except Exception as exc:
+        # Invalid seed data must not prevent the API from starting.
+        logger.error(
+            "Target seeding skipped: %s (%s)",
+            type(exc).__name__,
+            str(exc)[:200],
+        )
 
 
-app = FastAPI(
-    title="SolveEase 300-Target Task Engine API",
-    version="1.9.0",
-    lifespan=lifespan,
-    description="Neon-backed public opportunity discovery API.",
-)
+@app.on_event("startup")
+def startup_event():
+    logger.info("Starting %s version %s", APP_NAME, APP_VERSION)
+    seed_targets_if_enabled()
+
+    if ENABLE_API_BACKGROUND_SCANNER:
+        logger.warning(
+            "ENABLE_API_BACKGROUND_SCANNER=true. Ensure worker.py is not "
+            "also polling the same targets."
+        )
+    else:
+        logger.info("API background scanning disabled; worker.py owns continuous polling.")
 
 
-# ==================================================
-# ROOT AND HEALTH
-# ==================================================
+# ============================================================
+# PUBLIC STATUS
+# ============================================================
 
 @app.get("/")
 def root():
     return {
-        "service": "SolveEase 300-Target Task Engine API",
-        "version": "1.9.0",
-        "status": "running",
+        "service": APP_NAME,
+        "version": APP_VERSION,
+        "status": "online",
         "database": "Neon PostgreSQL",
-        "health_endpoint": "/api/health",
-        "documentation": "/docs",
-        "openapi": "/openapi.json",
+        "continuous_scanner": "worker.py",
+        "task_consumer": "consumer.py",
+        "note": "Online status does not prove that feeds or task providers are working.",
     }
 
 
 @app.get("/api/health")
 def health():
     try:
-        with connect_database() as conn:
-            conn.execute("SELECT 1").fetchone()
+        with closing(connect_database()) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1 AS ok")
+                cur.fetchone()
 
-            tables = conn.execute(
-                """
-                SELECT table_name
-                FROM information_schema.tables
-                WHERE table_schema = current_schema()
-                  AND table_type = 'BASE TABLE'
-                  AND table_name IN (
-                      'targets', 'tasks', 'task_events'
-                  )
-                """
-            ).fetchall()
-
-            found = {row["table_name"] for row in tables}
-            missing = sorted(
-                {"targets", "tasks", "task_events"} - found
-            )
-
-            if missing:
-                raise HTTPException(
-                    status_code=503,
-                    detail={
-                        "error": "Required database tables are missing.",
-                        "missing_tables": missing,
-                    },
+                cur.execute(
+                    """
+                    SELECT
+                        to_regclass('public.targets') AS targets_table,
+                        to_regclass('public.tasks') AS tasks_table,
+                        to_regclass('public.task_events') AS events_table
+                    """
                 )
+                tables = cur.fetchone()
+
+        missing = [
+            name for name, value in [
+                ("targets", tables["targets_table"]),
+                ("tasks", tables["tasks_table"]),
+                ("task_events", tables["events_table"]),
+            ]
+            if value is None
+        ]
+
+        if missing:
+            return {
+                "status": "degraded",
+                "database": "connected",
+                "missing_tables": missing,
+            }
 
         return {
-            "status": "ok",
+            "status": "healthy",
             "database": "connected",
-            "schema": "verified",
+            "tables": "present",
         }
 
-    except HTTPException:
-        raise
     except Exception as exc:
-        logger.error("Health check failed: %s", type(exc).__name__)
+        database_error("Health check", exc)
         raise HTTPException(
             status_code=503,
-            detail="Database unavailable. Check DATABASE_URL and Neon.",
-        ) from exc
+            detail="Database unavailable or schema not ready.",
+        ) from None
 
 
-# ==================================================
-# SUMMARY AND QUEUE
-# ==================================================
+# ============================================================
+# AUTHENTICATED API ENDPOINTS
+# ============================================================
 
-@app.get(
-    "/api/summary",
-    dependencies=[Depends(verify_api_key)],
-)
-def get_summary():
-    rows = query_db(
-        """
-        SELECT
-            (SELECT COUNT(*) FROM targets) AS targets,
-            (SELECT COUNT(*) FROM targets
-             WHERE is_active = TRUE) AS active_targets,
-            (SELECT COUNT(*) FROM tasks
-             WHERE status = 'pending') AS pending,
-            (SELECT COUNT(*) FROM tasks
-             WHERE status = 'processing') AS processing,
-            (SELECT COUNT(*) FROM tasks
-             WHERE status = 'completed') AS completed,
-            (SELECT COUNT(*) FROM tasks
-             WHERE status = 'failed') AS failed
-        """
-    )
-    return rows[0]
-
-
-@app.get(
-    "/api/queue/top",
-    dependencies=[Depends(verify_api_key)],
-)
-def get_top_tasks(limit: int = Query(default=10, ge=1, le=100)):
-    tasks = query_db(
-        """
-        SELECT
-            task_id, source_platform, category, payout_usd,
-            est_seconds, roc_score, status, created_at
-        FROM tasks
-        WHERE status = 'pending'
-          AND available_at <= NOW()
-        ORDER BY roc_score DESC, created_at ASC, id ASC
-        LIMIT %s
-        """,
-        (limit,),
-    )
-    return {"count": len(tasks), "top_queue": tasks}
-
-
-@app.get(
-    "/api/targets",
-    dependencies=[Depends(verify_api_key)],
-)
-def get_targets():
-    targets = query_db(
-        """
-        SELECT
-            id, platform_name, api_endpoint, extraction_method, tier,
-            is_active, consecutive_empty_polls, consecutive_failures,
-            last_checked, cooldown_until
-        FROM targets
-        ORDER BY tier, platform_name
-        """
-    )
-    return {"count": len(targets), "targets": targets}
-
-
-# ==================================================
-# REGISTER ONE OR MANY TARGETS
-# ==================================================
-
-@app.post(
-    "/api/targets/register",
-    status_code=status.HTTP_201_CREATED,
-    dependencies=[Depends(verify_api_key)],
-)
-def register_target(target: TargetRegistration):
-    try:
-        name, endpoint, method, tier = validate_target_values(
-            target.platform_name,
-            target.api_endpoint,
-            target.extraction_method,
-            target.tier,
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
+@app.get("/api/summary")
+def summary(_: bool = Depends(verify_api_key)):
+    require_database()
 
     try:
-        with connect_database() as conn:
-            row = conn.execute(
-                """
-                INSERT INTO targets (
-                    platform_name, api_endpoint, extraction_method,
-                    tier, is_active
+        with closing(connect_database()) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT
+                        COUNT(*) AS total_targets,
+                        COUNT(*) FILTER (WHERE is_active) AS active_targets
+                    FROM targets
+                    """
                 )
-                VALUES (%s, %s, %s, %s, FALSE)
-                ON CONFLICT (platform_name) DO NOTHING
-                RETURNING platform_name
-                """,
-                (name, endpoint, method, tier),
-            ).fetchone()
+                target_counts = cur.fetchone()
 
-            if not row:
-                raise HTTPException(
-                    status_code=409,
-                    detail="Target with this platform name already exists.",
+                cur.execute(
+                    """
+                    SELECT
+                        COUNT(*) AS total_tasks,
+                        COUNT(*) FILTER (WHERE status = 'pending') AS pending,
+                        COUNT(*) FILTER (WHERE status = 'processing') AS processing,
+                        COUNT(*) FILTER (WHERE status = 'completed') AS completed,
+                        COUNT(*) FILTER (WHERE status = 'failed') AS failed
+                    FROM tasks
+                    """
                 )
+                task_counts = cur.fetchone()
 
-    except HTTPException:
-        raise
+        return {
+            "targets": target_counts,
+            "tasks": task_counts,
+        }
+
     except Exception as exc:
-        logger.error("Target registration failed: %s", type(exc).__name__)
-        raise HTTPException(
-            status_code=503,
-            detail="Target registration failed.",
-        ) from exc
-
-    return {
-        "status": "registered",
-        "platform_name": name,
-        "tier": tier,
-        "is_active": False,
-        "message": "Registered inactive. Verify the source before activation.",
-    }
+        database_error("Summary endpoint", exc)
+        raise HTTPException(status_code=503, detail="Unable to retrieve summary.") from None
 
 
-@app.post(
-    "/api/targets/bulk-register",
-    status_code=status.HTTP_201_CREATED,
-    dependencies=[Depends(verify_api_key)],
-)
-def bulk_register_targets(
-    targets: list[TargetRegistration] = Field(max_length=MAX_BULK_TARGETS),
+@app.get("/api/queue/top")
+def queue_top(
+    limit: int = 20,
+    _: bool = Depends(verify_api_key),
 ):
-    registered = 0
-    skipped = 0
+    require_database()
+    limit = max(1, min(limit, 100))
 
     try:
-        with connect_database() as conn:
-            for target in targets:
-                name, endpoint, method, tier = validate_target_values(
-                    target.platform_name,
-                    target.api_endpoint,
-                    target.extraction_method,
-                    target.tier,
+        with closing(connect_database()) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT
+                        id, task_id, source_platform, category,
+                        payout_usd, est_seconds, roc_score,
+                        status, created_at
+                    FROM tasks
+                    WHERE status = 'pending'
+                    ORDER BY roc_score DESC, created_at ASC
+                    LIMIT %s
+                    """,
+                    (limit,),
                 )
+                rows = cur.fetchall()
 
-                row = conn.execute(
+        return {"count": len(rows), "tasks": rows}
+
+    except Exception as exc:
+        database_error("Queue endpoint", exc)
+        raise HTTPException(status_code=503, detail="Unable to retrieve task queue.") from None
+
+
+@app.get("/api/targets")
+def list_targets(_: bool = Depends(verify_api_key)):
+    require_database()
+
+    try:
+        with closing(connect_database()) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT
+                        id, platform_name, api_endpoint, extraction_method,
+                        tier, consecutive_empty_polls, consecutive_failures,
+                        is_active, last_checked, cooldown_until, created_at
+                    FROM targets
+                    ORDER BY tier ASC, platform_name ASC
+                    """
+                )
+                rows = cur.fetchall()
+
+        return {"count": len(rows), "targets": rows}
+
+    except Exception as exc:
+        database_error("Target listing", exc)
+        raise HTTPException(status_code=503, detail="Unable to retrieve targets.") from None
+
+
+def register_one_target(target: TargetRegistration):
+    with closing(connect_database()) as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute(
                     """
                     INSERT INTO targets (
-                        platform_name, api_endpoint,
-                        extraction_method, tier, is_active
+                        platform_name,
+                        api_endpoint,
+                        extraction_method,
+                        tier,
+                        is_active
                     )
-                    VALUES (%s, %s, %s, %s, FALSE)
-                    ON CONFLICT (platform_name) DO NOTHING
-                    RETURNING platform_name
+                    VALUES (%s, %s, %s, %s, %s)
+                    ON CONFLICT (platform_name)
+                    DO UPDATE SET
+                        api_endpoint = EXCLUDED.api_endpoint,
+                        extraction_method = EXCLUDED.extraction_method,
+                        tier = EXCLUDED.tier
+                    RETURNING id, platform_name, extraction_method, tier, is_active
                     """,
-                    (name, endpoint, method, tier),
-                ).fetchone()
+                    (
+                        target.platform_name,
+                        target.api_endpoint,
+                        target.extraction_method,
+                        target.tier,
+                        target.is_active,
+                    ),
+                )
+                return cur.fetchone()
 
-                if row:
-                    registered += 1
-                else:
-                    skipped += 1
 
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
+@app.post("/api/targets/register")
+def register_target(
+    target: TargetRegistration,
+    _: bool = Depends(verify_api_key),
+):
+    try:
+        row = register_one_target(target)
+        return {"status": "ok", "target": row}
+    except HTTPException:
+        raise
     except Exception as exc:
-        logger.error("Bulk registration failed: %s", type(exc).__name__)
-        raise HTTPException(
-            status_code=503,
-            detail="Bulk registration failed.",
-        ) from exc
+        database_error("Target registration", exc)
+        raise HTTPException(status_code=503, detail="Target registration failed.") from None
+
+
+@app.post("/api/targets/bulk-register")
+def bulk_register_targets(
+    targets: list[TargetRegistration] = Body(...),
+    _: bool = Depends(verify_api_key),
+):
+    if not targets:
+        raise HTTPException(status_code=400, detail="Provide at least one target.")
+
+    if len(targets) > 300:
+        raise HTTPException(status_code=400, detail="Maximum 300 targets per request.")
+
+    registered = []
+    errors = []
+
+    for target in targets:
+        try:
+            registered.append(register_one_target(target))
+        except Exception as exc:
+            database_error("Bulk target registration", exc)
+            errors.append({
+                "platform_name": target.platform_name,
+                "error": "Registration failed",
+            })
 
     return {
-        "status": "completed",
+        "status": "partial" if errors else "ok",
+        "registered_count": len(registered),
+        "error_count": len(errors),
         "registered": registered,
-        "skipped": skipped,
-        "total": len(targets),
+        "errors": errors,
     }
 
 
-# ==================================================
-# TARGET ACTIVATION
-# ==================================================
-
-@app.patch(
-    "/api/targets/{platform_name}/status",
-    dependencies=[Depends(verify_api_key)],
-)
-def set_target_status(
+@app.patch("/api/targets/{platform_name}/status")
+def update_target_status(
     platform_name: str,
-    status_update: TargetStatusUpdate,
+    update: TargetStatusUpdate,
+    _: bool = Depends(verify_api_key),
 ):
     try:
-        with connect_database() as conn:
-            row = conn.execute(
-                """
-                UPDATE targets
-                SET is_active = %s
-                WHERE platform_name = %s
-                RETURNING platform_name, is_active
-                """,
-                (status_update.is_active, platform_name),
-            ).fetchone()
+        with closing(connect_database()) as conn:
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        UPDATE targets
+                        SET is_active = %s
+                        WHERE platform_name = %s
+                        RETURNING id, platform_name, is_active
+                        """,
+                        (update.is_active, platform_name),
+                    )
+                    row = cur.fetchone()
 
-            if not row:
-                raise HTTPException(
-                    status_code=404,
-                    detail="Target not found.",
-                )
+        if not row:
+            raise HTTPException(status_code=404, detail="Target not found.")
+
+        return {"status": "ok", "target": row}
 
     except HTTPException:
         raise
     except Exception as exc:
-        logger.error("Target status update failed: %s", type(exc).__name__)
-        raise HTTPException(
-            status_code=503,
-            detail="Target status update failed.",
-        ) from exc
-
-    return {
-        "status": "updated",
-        "platform_name": row["platform_name"],
-        "is_active": row["is_active"],
-    }
+        database_error("Target status update", exc)
+        raise HTTPException(status_code=503, detail="Target status update failed.") from None
 
 
-# ==================================================
-# MANUAL SCAN
-# ==================================================
-
-@app.post(
-    "/api/engine/trigger",
-    dependencies=[Depends(verify_api_key)],
-)
-async def trigger_engine_poll():
+@app.post("/api/engine/trigger")
+def trigger_engine(_: bool = Depends(verify_api_key)):
+    """
+    Manually scan active HTTPX JSON feeds once.
+    This does not execute tasks or guarantee provider availability.
+    """
     try:
-        result = await asyncio.to_thread(execute_engine_scan_cycle)
-        return {
-            "status": "completed",
-            **result,
-            "note": "Discovery only; no task completion or payout is implied.",
-        }
+        result = execute_engine_scan_cycle()
+        send_telegram_alert(
+            "SolveEase manual scan finished.\n"
+            f"Targets checked: {result['targets_checked']}\n"
+            f"New tasks inserted: {result['tasks_inserted']}"
+        )
+        return {"status": "finished", **result}
 
+    except HTTPException:
+        raise
     except Exception as exc:
-        logger.error("Manual scan failed: %s", type(exc).__name__)
-        raise HTTPException(
-            status_code=503,
-            detail="Engine scan failed. Check service logs.",
-        ) from exc
+        database_error("Manual engine trigger", exc)
+        raise HTTPException(status_code=503, detail="Manual scan failed.") from None
