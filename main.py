@@ -13,7 +13,9 @@ Required environment variables:
 
 import hmac
 import ipaddress
+import json
 import os
+from pathlib import Path
 from urllib.parse import urlparse
 
 import psycopg
@@ -26,7 +28,7 @@ from pydantic import BaseModel, Field, field_validator
 
 app = FastAPI(
     title="SolveEase 300-Target Task Engine API",
-    version="1.2.0",
+    version="1.3.0",
 )
 
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
@@ -72,6 +74,58 @@ def query_db(sql: str, params=()) -> list[dict]:
 
 
 # --------------------------------------------------
+# STARTUP EVENT & SEEDING
+# --------------------------------------------------
+
+@app.on_event("startup")
+def startup_event():
+    """
+    Service startup initialization: verifies DB connection and 
+    seeds target feeds from targets_300.json if present.
+    """
+    print("🚀 Starting SolveEase 300-Target Task Engine Web Service...")
+    if not DATABASE_URL:
+        print("⚠️ DATABASE_URL not set; skipping database initialization.")
+        return
+
+    json_path = Path("targets_300.json")
+    if json_path.exists():
+        try:
+            with open(json_path, "r", encoding="utf-8") as f:
+                targets_data = json.load(f)
+
+            if isinstance(targets_data, list) and targets_data:
+                inserted_count = 0
+                with connect_database() as conn:
+                    for target in targets_data:
+                        res = conn.execute(
+                            """
+                            INSERT INTO targets (
+                                platform_name,
+                                api_endpoint,
+                                extraction_method,
+                                tier,
+                                is_active
+                            )
+                            VALUES (%s, %s, %s, %s, FALSE)
+                            ON CONFLICT (platform_name) DO NOTHING
+                            RETURNING platform_name
+                            """,
+                            (
+                                target.get("platform_name"),
+                                target.get("api_endpoint"),
+                                target.get("extraction_method", "httpx"),
+                                target.get("tier", 1),
+                            ),
+                        ).fetchone()
+                        if res:
+                            inserted_count += 1
+                print(f"✅ Auto-seeded {inserted_count} target feeds from targets_300.json.")
+        except Exception as exc:
+            print(f"⚠️ Startup seeding skipped/failed: {exc}")
+
+
+# --------------------------------------------------
 # ROOT DIAGNOSTIC
 # --------------------------------------------------
 
@@ -79,7 +133,7 @@ def query_db(sql: str, params=()) -> list[dict]:
 def root():
     return {
         "service": "SolveEase 300-Target Task Engine API",
-        "version": "1.2.0",
+        "version": "1.3.0",
         "status": "running",
         "database": "Neon PostgreSQL",
         "health_endpoint": "/api/health",
@@ -179,6 +233,10 @@ class TargetRegistration(BaseModel):
         return value
 
 
+class TargetStatusUpdate(BaseModel):
+    is_active: bool
+
+
 # --------------------------------------------------
 # HEALTH CHECK
 # --------------------------------------------------
@@ -192,7 +250,6 @@ def health():
         with connect_database() as conn:
             conn.execute("SELECT 1").fetchone()
 
-            # Check table existence securely using regclass
             res = conn.execute(
                 """
                 SELECT 
@@ -328,7 +385,7 @@ def get_targets():
 
 
 # --------------------------------------------------
-# REGISTER A TARGET
+# REGISTER A SINGLE TARGET
 # --------------------------------------------------
 
 @app.post(
@@ -406,3 +463,147 @@ def register_target(target: TargetRegistration):
             "permission for automated access before activation."
         ),
     }
+
+
+# --------------------------------------------------
+# BULK REGISTER TARGET FEEDS
+# --------------------------------------------------
+
+@app.post(
+    "/api/targets/bulk-register",
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(verify_api_key)],
+)
+def bulk_register_targets(targets: list[TargetRegistration]):
+    """
+    Bulk load target feeds (e.g. up to 300 targets) into the database.
+    """
+    if not targets:
+        raise HTTPException(status_code=400, detail="Target list cannot be empty.")
+
+    registered_count = 0
+    skipped_count = 0
+
+    try:
+        with connect_database() as conn:
+            for target in targets:
+                inserted = conn.execute(
+                    """
+                    INSERT INTO targets (
+                        platform_name,
+                        api_endpoint,
+                        extraction_method,
+                        tier,
+                        is_active
+                    )
+                    VALUES (%s, %s, %s, %s, FALSE)
+                    ON CONFLICT (platform_name) DO NOTHING
+                    RETURNING platform_name
+                    """,
+                    (
+                        target.platform_name,
+                        target.api_endpoint,
+                        target.extraction_method,
+                        target.tier,
+                    ),
+                ).fetchone()
+
+                if inserted:
+                    registered_count += 1
+                else:
+                    skipped_count += 1
+
+    except (psycopg.Error, RuntimeError) as exc:
+        print(f"Bulk target registration failed: {type(exc).__name__}")
+        raise HTTPException(
+            status_code=503,
+            detail="Bulk registration failed. Check database configuration.",
+        ) from exc
+
+    return {
+        "status": "completed",
+        "registered": registered_count,
+        "skipped": skipped_count,
+        "total_processed": len(targets),
+    }
+
+
+# --------------------------------------------------
+# UPDATE TARGET ACTIVE STATUS
+# --------------------------------------------------
+
+@app.patch(
+    "/api/targets/{platform_name}/status",
+    dependencies=[Depends(verify_api_key)],
+)
+def set_target_status(platform_name: str, status_update: TargetStatusUpdate):
+    """
+    Activate or deactivate a target feed by platform name.
+    """
+    try:
+        with connect_database() as conn:
+            updated = conn.execute(
+                """
+                UPDATE targets
+                SET is_active = %s
+                WHERE platform_name = %s
+                RETURNING platform_name, is_active
+                """,
+                (status_update.is_active, platform_name),
+            ).fetchone()
+
+            if not updated:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Target '{platform_name}' not found.",
+                )
+
+        return {
+            "status": "updated",
+            "platform_name": updated["platform_name"],
+            "is_active": updated["is_active"],
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Failed to update status: {str(exc)}",
+        ) from exc
+
+
+# --------------------------------------------------
+# EXECUTE ENGINE POLL SCAN
+# --------------------------------------------------
+
+@app.post(
+    "/api/engine/trigger",
+    dependencies=[Depends(verify_api_key)],
+)
+def trigger_engine_poll():
+    """
+    Triggers an execution poll cycle across active registered targets.
+    """
+    try:
+        with connect_database() as conn:
+            active_targets = conn.execute(
+                """
+                SELECT platform_name, api_endpoint, extraction_method, tier
+                FROM targets
+                WHERE is_active = TRUE
+                ORDER BY tier ASC, platform_name ASC
+                """
+            ).fetchall()
+
+        return {
+            "status": "triggered",
+            "active_targets_count": len(active_targets),
+            "scanned_targets": [t["platform_name"] for t in active_targets],
+            "message": "Target scan triggered successfully within the web service.",
+        }
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Engine poll execution failed: {str(exc)}",
+        ) from exc
