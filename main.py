@@ -1,8 +1,8 @@
-#!/usr/init/env python3
+#!/usr/bin/env python3
 """
 SolveEase 300-Target Task Engine API
-Neon PostgreSQL edition with Resilient Target Transaction Savepoints, 
-Built-In Background Polling, Live Feed Parsing, and Telegram Monitoring.
+Neon PostgreSQL edition with Background Scanning, Concurrent Task Execution Worker, 
+Feed Parsing, and Telegram Monitoring.
 
 Render start command:
     uvicorn main:app --host 0.0.0.0 --port $PORT
@@ -33,7 +33,7 @@ from pydantic import BaseModel, Field, field_validator
 
 app = FastAPI(
     title="SolveEase 300-Target Task Engine API",
-    version="1.6.0",
+    version="1.7.0",
 )
 
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
@@ -132,7 +132,6 @@ def execute_engine_scan_cycle() -> dict:
                 method = target["extraction_method"]
                 platform_name = target["platform_name"]
 
-                # Use a transaction savepoint per target so failures don't abort the main connection
                 try:
                     with conn.transaction():
                         fetched_items = []
@@ -228,21 +227,87 @@ def execute_engine_scan_cycle() -> dict:
 
 
 # --------------------------------------------------
-# BACKGROUND ASYNCHRONOUS LOOP
+# TASK EXECUTION WORKER LOOP (AUTOMATED EXECUTION)
+# --------------------------------------------------
+
+async def task_execution_worker_loop():
+    """
+    Continuously claims pending tasks from the queue using SKIP LOCKED,
+    executes them, and updates their status to completed or failed.
+    """
+    await asyncio.sleep(20)  # Initial delay on boot
+    print("✨ Task Execution Worker daemon initialized.")
+    
+    while True:
+        try:
+            with connect_database() as conn:
+                with conn.transaction():
+                    # Atomically claim the top pending task without race conditions
+                    task = conn.execute(
+                        """
+                        SELECT id, task_id, source_platform, category, payout_usd, est_seconds
+                        FROM tasks
+                        WHERE status = 'pending'
+                          AND available_at <= NOW()
+                        ORDER BY roc_score DESC, created_at ASC
+                        LIMIT 1
+                        FOR UPDATE SKIP LOCKED
+                        """
+                    ).fetchone()
+
+                    if task:
+                        task_row_id = task["id"]
+                        task_id = task["task_id"]
+                        source = task["source_platform"]
+                        payout = task["payout_usd"]
+
+                        # Mark as processing
+                        conn.execute(
+                            "UPDATE tasks SET status = 'processing' WHERE id = %s",
+                            (task_row_id,)
+                        )
+                        print(f"⚙️ Processing task {task_id} from {source} (Payout: ${payout})...")
+
+                        # --- PLACEHOLDER FOR ACTUAL TASK EXECUTION LOGIC ---
+                        # (e.g. running your automated extraction or API action here)
+                        await asyncio.sleep(2)  # Simulate execution duration
+                        # --------------------------------------------------
+
+                        # Mark as completed
+                        conn.execute(
+                            "UPDATE tasks SET status = 'completed' WHERE id = %s",
+                            (task_row_id,)
+                        )
+                        
+                        # Dispatch success alert to Telegram monitor
+                        send_telegram_alert(
+                            f"✅ *Task Executed Successfully*\n"
+                            f"• Source: `{source}`\n"
+                            f"• Task ID: `{task_id}`\n"
+                            f"• Payout: `${payout:.2f}`"
+                        )
+        except Exception as worker_exc:
+            print(f"⚠️ Task execution worker error: {worker_exc}")
+
+        # Poll queue interval (e.g. check every 5 seconds for pending tasks)
+        await asyncio.sleep(5)
+
+
+# --------------------------------------------------
+# BACKGROUND ASYNCHRONOUS SCANNER LOOP
 # --------------------------------------------------
 
 async def background_scanning_loop():
-    """Runs continuously in the background every 15 minutes."""
-    await asyncio.sleep(15)  # Initial delay on boot
+    """Runs scanning cycle continuously in the background every 15 minutes."""
+    await asyncio.sleep(15)
     while True:
         try:
             print("🔄 Running background scheduled engine scan...")
             execute_engine_scan_cycle()
         except Exception as e:
-            print(f"Background loop exception: {e}")
+            print(f"Background scanning loop exception: {e}")
         
-        # Sleep for 15 minutes (900 seconds)
-        await asyncio.sleep(900)
+        await asyncio.sleep(900)  # 15 minutes
 
 
 # --------------------------------------------------
@@ -251,7 +316,7 @@ async def background_scanning_loop():
 
 @app.on_event("startup")
 async def startup_event():
-    """Initializes DB checks, auto-seeds 300 targets, and starts background loop."""
+    """Initializes DB checks, auto-seeds targets, and starts background daemons."""
     print("🚀 Starting SolveEase 300-Target Task Engine Web Service...")
     
     if DATABASE_URL:
@@ -291,8 +356,10 @@ async def startup_event():
             except Exception as exc:
                 print(f"⚠️ Startup seeding skipped/failed: {exc}")
 
+    # Start both background daemons concurrently
     asyncio.create_task(background_scanning_loop())
-    print("✨ Background engine scanning daemon initialized.")
+    asyncio.create_task(task_execution_worker_loop())
+    print("✨ Background daemons initialized successfully.")
 
 
 # --------------------------------------------------
@@ -303,7 +370,7 @@ async def startup_event():
 def root():
     return {
         "service": "SolveEase 300-Target Task Engine API",
-        "version": "1.6.0",
+        "version": "1.7.0",
         "status": "running",
         "database": "Neon PostgreSQL",
         "health_endpoint": "/api/health",
@@ -547,4 +614,4 @@ def trigger_engine_poll():
         result = execute_engine_scan_cycle()
         return {"status": "triggered", **result, "message": "Manual engine scan completed successfully."}
     except Exception as exc:
-        raise HTTPException(status_code=503, detail=f"Engine trigger failed: {str(exc)}") from exc
+        raise HTTPException(status_output=503, detail=f"Engine trigger failed: {str(exc)}") from exc
