@@ -1,37 +1,46 @@
-name: Automated Task Pipeline
+name: SolveEase Automated Task Pipeline
 
 on:
-  schedule:
-    - cron: '*/30 * * * *' # Runs every 30 minutes
-  workflow_dispatch: # Allows manual trigger from GitHub UI
+schedule:
+- cron: '*/30 * * * *'
+workflow_dispatch:
+
+permissions:
+contents: read
+
+concurrency:
+group: solveease-task-pipeline
+cancel-in-progress: false
 
 jobs:
-  run-pipeline:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
+run-pipeline:
+runs-on: ubuntu-latest
+timeout-minutes: 10
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
+steps:
+  - name: Checkout Repository
+    uses: actions/checkout@v4
 
-      - name: Install Dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install httpx psycopg
+  - name: Set up Python
+    uses: actions/setup-python@v5
+    with:
+      python-version: '3.11'
+      cache: pip
+      cache-dependency-path: requirements.txt
 
-      - name: Run Ingestion Worker
-        env:
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
-        run: |
-          python worker.py
+  - name: Install Dependencies
+    run: |
+      python -m pip install --upgrade pip
+      pip install -r requirements.txt
+      playwright install --with-deps chromium
 
-      - name: Run Task Processor
-        env:
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: |
-          python processor.py
+  - name: Run Ingestion Worker
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+    run: python worker.py
+
+  - name: Run Task Consumer
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      DRY_RUN: "true"
+    run: python consumer.py
