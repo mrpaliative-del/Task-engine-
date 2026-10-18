@@ -1,10 +1,10 @@
-
 import hashlib
 import ipaddress
 import json
 import logging
 import math
 import os
+import re
 import socket
 from contextlib import closing
 from decimal import Decimal, InvalidOperation
@@ -20,7 +20,7 @@ from pydantic import BaseModel, Field, field_validator
 
 # ============================================================
 # SolveEase 300-Target Task Engine
-# Version 2.0.0 — Neon PostgreSQL
+# Version 2.0.1 — Neon PostgreSQL
 #
 # API manages targets, queue visibility and manual feed scans.
 # worker.py owns continuous feed polling.
@@ -28,7 +28,7 @@ from pydantic import BaseModel, Field, field_validator
 # ============================================================
 
 APP_NAME = "SolveEase 300-Target Task Engine"
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.0.1"
 
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 ENGINE_API_KEY = os.getenv("ENGINE_API_KEY", "").strip()
@@ -65,17 +65,39 @@ def connect_database():
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL is not configured")
 
+    clean_url = DATABASE_URL.strip().strip("'").strip('"')
+    if "sslmode=" not in clean_url:
+        separator = "&" if "?" in clean_url else "?"
+        clean_url += f"{separator}sslmode=require"
+
     return psycopg.connect(
-        DATABASE_URL,
+        clean_url,
         connect_timeout=10,
         row_factory=dict_row,
     )
 
 
 def database_error(operation: str, exc: Exception):
-    # Log the exception internally. Never return connection strings
-    # or raw database exception details to API callers.
-    logger.error("%s failed: %s", operation, type(exc).__name__)
+    # Redact common credential formats before writing logs.
+    detail = str(exc)
+    detail = re.sub(
+        r"(?i)(postgres(?:ql)?://)[^@\s]+@",
+        r"\1[REDACTED]@",
+        detail,
+    )
+    detail = re.sub(
+        r"(?i)\b(password|passwd|pwd)\s*=\s*[^;\s]+",
+        r"\1=[REDACTED]",
+        detail,
+    )
+
+    logger.error(
+        "%s failed: exception=%s SQLSTATE=%s detail=%s",
+        operation,
+        type(exc).__name__,
+        getattr(exc, "sqlstate", None),
+        detail[:300],
+    )
 
 
 def require_database():
@@ -187,7 +209,6 @@ class TargetRegistration(BaseModel):
     @field_validator("api_endpoint")
     @classmethod
     def check_endpoint(cls, value, info):
-        # The extraction method may not yet have been validated.
         method = info.data.get("extraction_method", "httpx")
         return validate_endpoint_url(value, method)
 
@@ -230,8 +251,6 @@ def send_telegram_alert(message: str) -> bool:
 
 # ============================================================
 # SAFE FEED PARSING
-# The manual API scan supports HTTPX JSON feeds only.
-# Continuous scanning belongs to worker.py.
 # ============================================================
 
 def extract_task_list(data):
@@ -310,11 +329,6 @@ def normalize_task(item: dict, platform_name: str):
 
 
 def scan_one_target(target: dict) -> dict:
-    """
-    Poll one HTTPX JSON target.
-    Each target gets its own transaction, so one failure does not
-    roll back other targets.
-    """
     if target["extraction_method"] != "httpx":
         return {
             "platform": target["platform_name"],
@@ -329,7 +343,6 @@ def scan_one_target(target: dict) -> dict:
     )
 
     try:
-        # Do not automatically follow redirects to an unvalidated host.
         with httpx.Client(
             timeout=SCAN_TIMEOUT_SECONDS,
             follow_redirects=False,
@@ -478,8 +491,6 @@ def execute_engine_scan_cycle():
 
 # ============================================================
 # OPTIONAL SAFE SEEDING
-# AUTO_SEED_TARGETS defaults to false.
-# Seeded records are always inactive.
 # ============================================================
 
 def seed_targets_if_enabled():
@@ -543,7 +554,6 @@ def seed_targets_if_enabled():
         logger.info("Target seeding completed; valid entries: %s", len(valid_targets))
 
     except Exception as exc:
-        # Invalid seed data must not prevent the API from starting.
         logger.error(
             "Target seeding skipped: %s (%s)",
             type(exc).__name__,
@@ -848,10 +858,6 @@ def update_target_status(
 
 @app.post("/api/engine/trigger")
 def trigger_engine(_: bool = Depends(verify_api_key)):
-    """
-    Manually scan active HTTPX JSON feeds once.
-    This does not execute tasks or guarantee provider availability.
-    """
     try:
         result = execute_engine_scan_cycle()
         send_telegram_alert(
