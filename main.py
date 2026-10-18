@@ -1,8 +1,8 @@
-#!/usr/bin/env python3
+#!/usr/init/env python3
 """
 SolveEase 300-Target Task Engine API
-Neon PostgreSQL edition with Built-In Background Polling, 
-Live Feed Parsing, and Telegram Monitoring.
+Neon PostgreSQL edition with Resilient Target Transaction Savepoints, 
+Built-In Background Polling, Live Feed Parsing, and Telegram Monitoring.
 
 Render start command:
     uvicorn main:app --host 0.0.0.0 --port $PORT
@@ -33,7 +33,7 @@ from pydantic import BaseModel, Field, field_validator
 
 app = FastAPI(
     title="SolveEase 300-Target Task Engine API",
-    version="1.5.0",
+    version="1.6.0",
 )
 
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
@@ -103,14 +103,13 @@ def send_telegram_alert(message: str):
 
 
 # --------------------------------------------------
-# ENGINE SCAN & PARSING LOGIC
+# ENGINE SCAN & PARSING LOGIC (WITH SAVEPOINTS)
 # --------------------------------------------------
 
 def execute_engine_scan_cycle() -> dict:
     """
-    Scans active targets, queries their live API endpoints, 
-    parses discovered tasks, saves them to Neon PostgreSQL, 
-    and dispatches an activity report to Telegram.
+    Scans active targets using savepoints per target, parses discovered tasks, 
+    saves them to Neon PostgreSQL, and dispatches an activity report to Telegram.
     """
     scanned_count = 0
     tasks_discovered = 0
@@ -133,73 +132,77 @@ def execute_engine_scan_cycle() -> dict:
                 method = target["extraction_method"]
                 platform_name = target["platform_name"]
 
+                # Use a transaction savepoint per target so failures don't abort the main connection
                 try:
-                    fetched_items = []
+                    with conn.transaction():
+                        fetched_items = []
 
-                    if method == "httpx":
-                        with httpx.Client(timeout=10, follow_redirects=True) as client:
-                            response = client.get(endpoint)
-                            if response.status_code == 200:
-                                data = response.json()
-                                if isinstance(data, list):
-                                    fetched_items = data
-                                elif isinstance(data, dict):
-                                    fetched_items = data.get("tasks", data.get("data", []))
+                        if method == "httpx":
+                            with httpx.Client(timeout=10, follow_redirects=True) as client:
+                                response = client.get(endpoint)
+                                if response.status_code == 200:
+                                    data = response.json()
+                                    if isinstance(data, list):
+                                        fetched_items = data
+                                    elif isinstance(data, dict):
+                                        fetched_items = data.get("tasks", data.get("data", []))
 
-                    elif method == "websocket":
-                        # Placeholder for WebSocket telemetry stream ingestion
-                        pass
+                        elif method == "websocket":
+                            pass
 
-                    for item in fetched_items:
-                        task_id = item.get("task_id") or f"{platform_name}-{abs(hash(str(item)))}"
-                        category = item.get("category", "General")
-                        payout_usd = float(item.get("payout_usd", 0.0))
-                        est_seconds = int(item.get("est_seconds", 60))
-                        
-                        # Calculate ROC score (Return on Cost efficiency metric)
-                        roc_score = round(payout_usd / (est_seconds / 60 + 0.1), 4)
+                        for item in fetched_items:
+                            task_id = item.get("task_id") or f"{platform_name}-{abs(hash(str(item)))}"
+                            category = item.get("category", "General")
+                            payout_usd = float(item.get("payout_usd", 0.0))
+                            est_seconds = int(item.get("est_seconds", 60))
+                            
+                            roc_score = round(payout_usd / (est_seconds / 60 + 0.1), 4)
 
-                        inserted = conn.execute(
-                            """
-                            INSERT INTO tasks (
-                                task_id,
-                                source_platform,
-                                category,
-                                payout_usd,
-                                est_seconds,
-                                roc_score,
-                                status,
-                                available_at
-                            )
-                            VALUES (%s, %s, %s, %s, %s, %s, 'pending', NOW())
-                            ON CONFLICT (task_id) DO NOTHING
-                            RETURNING task_id
-                            """,
-                            (
-                                str(task_id),
-                                platform_name,
-                                category,
-                                payout_usd,
-                                est_seconds,
-                                roc_score,
-                            ),
-                        ).fetchone()
+                            inserted = conn.execute(
+                                """
+                                INSERT INTO tasks (
+                                    task_id,
+                                    source_platform,
+                                    category,
+                                    payout_usd,
+                                    est_seconds,
+                                    roc_score,
+                                    status,
+                                    available_at
+                                )
+                                VALUES (%s, %s, %s, %s, %s, %s, 'pending', NOW())
+                                ON CONFLICT (task_id) DO NOTHING
+                                RETURNING task_id
+                                """,
+                                (
+                                    str(task_id),
+                                    platform_name,
+                                    category,
+                                    payout_usd,
+                                    est_seconds,
+                                    roc_score,
+                                ),
+                            ).fetchone()
 
-                        if inserted:
-                            tasks_discovered += 1
+                            if inserted:
+                                tasks_discovered += 1
 
-                    conn.execute(
-                        "UPDATE targets SET last_checked = NOW(), consecutive_empty_polls = 0 WHERE platform_name = %s",
-                        (platform_name,),
-                    )
+                        conn.execute(
+                            "UPDATE targets SET last_checked = NOW(), consecutive_empty_polls = 0 WHERE platform_name = %s",
+                            (platform_name,),
+                        )
 
                 except Exception as target_exc:
                     errors_encountered += 1
                     print(f"⚠️ Scan error on {platform_name}: {target_exc}")
-                    conn.execute(
-                        "UPDATE targets SET consecutive_failures = consecutive_failures + 1 WHERE platform_name = %s",
-                        (platform_name,),
-                    )
+                    try:
+                        with conn.transaction():
+                            conn.execute(
+                                "UPDATE targets SET consecutive_failures = consecutive_failures + 1 WHERE platform_name = %s",
+                                (platform_name,),
+                            )
+                    except Exception:
+                        pass
 
         report = (
             f"⚡ *SolveEase Engine Scan Report*\n"
@@ -300,7 +303,7 @@ async def startup_event():
 def root():
     return {
         "service": "SolveEase 300-Target Task Engine API",
-        "version": "1.5.0",
+        "version": "1.6.0",
         "status": "running",
         "database": "Neon PostgreSQL",
         "health_endpoint": "/api/health",
