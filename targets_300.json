@@ -1,0 +1,15 @@
+[
+  {
+    "platform_name": "TaskStream Global",
+    "api_endpoint": "https://api.taskstream-global.io/v1/stream",
+    "extraction_method": "httpx",
+    "tier": 1
+  },
+  {
+    "platform_name": "Apex MicroTasks",
+    "api_endpoint": "https://feed.apex-microtasks.net/ws/stream",
+    "extraction_method": "websocket",
+    "tier": 1
+  }
+  // ... up to your 300 targets
+]
