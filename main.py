@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 SolveEase 300-Target Task Engine API
-Neon PostgreSQL edition with Built-In Background Polling & Telegram Monitoring.
+Neon PostgreSQL edition with Built-In Background Polling, 
+Live Feed Parsing, and Telegram Monitoring.
 
 Render start command:
     uvicorn main:app --host 0.0.0.0 --port $PORT
@@ -9,8 +10,8 @@ Render start command:
 Required environment variables:
     DATABASE_URL
     ENGINE_API_KEY
-    TELEGRAM_BOT_TOKEN (optional)
-    TELEGRAM_CHAT_ID (optional)
+    TELEGRAM_BOT_TOKEN
+    TELEGRAM_CHAT_ID
 """
 
 import asyncio
@@ -32,7 +33,7 @@ from pydantic import BaseModel, Field, field_validator
 
 app = FastAPI(
     title="SolveEase 300-Target Task Engine API",
-    version="1.4.0",
+    version="1.5.0",
 )
 
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
@@ -89,26 +90,31 @@ def send_telegram_alert(message: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     try:
         with httpx.Client(timeout=10) as client:
-            client.post(url, json={
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": message,
-                "parse_mode": "Markdown"
-            })
+            client.post(
+                url,
+                json={
+                    "chat_id": TELEGRAM_CHAT_ID,
+                    "text": message,
+                    "parse_mode": "Markdown",
+                },
+            )
     except Exception as exc:
         print(f"Telegram dispatch failed: {exc}")
 
 
 # --------------------------------------------------
-# ENGINE SCAN & EXECUTION LOGIC
+# ENGINE SCAN & PARSING LOGIC
 # --------------------------------------------------
 
 def execute_engine_scan_cycle() -> dict:
     """
-    Scans active targets, queries their feeds, updates states, 
-    and dispatches a monitoring report to Telegram.
+    Scans active targets, queries their live API endpoints, 
+    parses discovered tasks, saves them to Neon PostgreSQL, 
+    and dispatches an activity report to Telegram.
     """
     scanned_count = 0
     tasks_discovered = 0
+    errors_encountered = 0
 
     try:
         with connect_database() as conn:
@@ -123,22 +129,83 @@ def execute_engine_scan_cycle() -> dict:
 
             for target in active_targets:
                 scanned_count += 1
-                # Example: Lightweight HTTP ping simulation for target feed
                 endpoint = target["api_endpoint"]
                 method = target["extraction_method"]
+                platform_name = target["platform_name"]
 
                 try:
+                    fetched_items = []
+
                     if method == "httpx":
-                        # In production, query the actual feed endpoint securely
-                        # with httpx.get(endpoint, timeout=5)
+                        with httpx.Client(timeout=10, follow_redirects=True) as client:
+                            response = client.get(endpoint)
+                            if response.status_code == 200:
+                                data = response.json()
+                                if isinstance(data, list):
+                                    fetched_items = data
+                                elif isinstance(data, dict):
+                                    fetched_items = data.get("tasks", data.get("data", []))
+
+                    elif method == "websocket":
+                        # Placeholder for WebSocket telemetry stream ingestion
                         pass
-                except Exception as poll_exc:
-                    print(f"Target poll failed for {target['platform_name']}: {poll_exc}")
+
+                    for item in fetched_items:
+                        task_id = item.get("task_id") or f"{platform_name}-{abs(hash(str(item)))}"
+                        category = item.get("category", "General")
+                        payout_usd = float(item.get("payout_usd", 0.0))
+                        est_seconds = int(item.get("est_seconds", 60))
+                        
+                        # Calculate ROC score (Return on Cost efficiency metric)
+                        roc_score = round(payout_usd / (est_seconds / 60 + 0.1), 4)
+
+                        inserted = conn.execute(
+                            """
+                            INSERT INTO tasks (
+                                task_id,
+                                source_platform,
+                                category,
+                                payout_usd,
+                                est_seconds,
+                                roc_score,
+                                status,
+                                available_at
+                            )
+                            VALUES (%s, %s, %s, %s, %s, %s, 'pending', NOW())
+                            ON CONFLICT (task_id) DO NOTHING
+                            RETURNING task_id
+                            """,
+                            (
+                                str(task_id),
+                                platform_name,
+                                category,
+                                payout_usd,
+                                est_seconds,
+                                roc_score,
+                            ),
+                        ).fetchone()
+
+                        if inserted:
+                            tasks_discovered += 1
+
+                    conn.execute(
+                        "UPDATE targets SET last_checked = NOW(), consecutive_empty_polls = 0 WHERE platform_name = %s",
+                        (platform_name,),
+                    )
+
+                except Exception as target_exc:
+                    errors_encountered += 1
+                    print(f"⚠️ Scan error on {platform_name}: {target_exc}")
+                    conn.execute(
+                        "UPDATE targets SET consecutive_failures = consecutive_failures + 1 WHERE platform_name = %s",
+                        (platform_name,),
+                    )
 
         report = (
             f"⚡ *SolveEase Engine Scan Report*\n"
             f"• Active Targets Scanned: `{scanned_count}`\n"
-            f"• Tasks Discovered: `{tasks_discovered}`\n"
+            f"• New Tasks Discovered: `{tasks_discovered}`\n"
+            f"• Errors Encountered: `{errors_encountered}`\n"
             f"• Status: `Operational`"
         )
         send_telegram_alert(report)
@@ -147,17 +214,18 @@ def execute_engine_scan_cycle() -> dict:
             "status": "success",
             "scanned_targets": scanned_count,
             "tasks_discovered": tasks_discovered,
+            "errors": errors_encountered,
         }
 
     except Exception as exc:
-        err_msg = f"❌ Engine scan cycle error: {type(exc).__name__}: {str(exc)}"
+        err_msg = f"❌ Engine scan cycle critical error: {type(exc).__name__}: {str(exc)}"
         print(err_msg)
         send_telegram_alert(err_msg)
         raise
 
 
 # --------------------------------------------------
-# BACKGROUND ASYNCHRONOUS LOOP (APPROACH 1)
+# BACKGROUND ASYNCHRONOUS LOOP
 # --------------------------------------------------
 
 async def background_scanning_loop():
@@ -220,7 +288,6 @@ async def startup_event():
             except Exception as exc:
                 print(f"⚠️ Startup seeding skipped/failed: {exc}")
 
-    # Start Approach 1: Background asynchronous scanner loop
     asyncio.create_task(background_scanning_loop())
     print("✨ Background engine scanning daemon initialized.")
 
@@ -233,7 +300,7 @@ async def startup_event():
 def root():
     return {
         "service": "SolveEase 300-Target Task Engine API",
-        "version": "1.4.0",
+        "version": "1.5.0",
         "status": "running",
         "database": "Neon PostgreSQL",
         "health_endpoint": "/api/health",
@@ -397,7 +464,7 @@ def get_targets():
 
 
 # --------------------------------------------------
-# MANAGEMENT & TRIGGER ENDPOINTS (APPROACH 2)
+# MANAGEMENT & TRIGGER ENDPOINTS
 # --------------------------------------------------
 
 @app.post("/api/targets/register", status_code=status.HTTP_201_CREATED, dependencies=[Depends(verify_api_key)])
