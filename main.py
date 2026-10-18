@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 SolveEase 300-Target Task Engine API
-Neon PostgreSQL edition with Background Scanning, Concurrent Task Execution Worker, 
-Feed Parsing, and Telegram Monitoring.
+Neon PostgreSQL edition with Detailed Error Logging, Savepoints, 
+Background Scanning, Task Worker, and Telegram Monitoring.
 
 Render start command:
     uvicorn main:app --host 0.0.0.0 --port $PORT
@@ -33,7 +33,7 @@ from pydantic import BaseModel, Field, field_validator
 
 app = FastAPI(
     title="SolveEase 300-Target Task Engine API",
-    version="1.7.0",
+    version="1.8.0",
 )
 
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
@@ -103,17 +103,19 @@ def send_telegram_alert(message: str):
 
 
 # --------------------------------------------------
-# ENGINE SCAN & PARSING LOGIC (WITH SAVEPOINTS)
+# ENGINE SCAN & PARSING LOGIC (DETAILED LOGGING)
 # --------------------------------------------------
 
 def execute_engine_scan_cycle() -> dict:
     """
     Scans active targets using savepoints per target, parses discovered tasks, 
-    saves them to Neon PostgreSQL, and dispatches an activity report to Telegram.
+    saves them to Neon PostgreSQL, records precise error telemetry, 
+    and dispatches an activity report to Telegram.
     """
     scanned_count = 0
     tasks_discovered = 0
     errors_encountered = 0
+    error_summary = []
 
     try:
         with connect_database() as conn:
@@ -139,12 +141,12 @@ def execute_engine_scan_cycle() -> dict:
                         if method == "httpx":
                             with httpx.Client(timeout=10, follow_redirects=True) as client:
                                 response = client.get(endpoint)
-                                if response.status_code == 200:
-                                    data = response.json()
-                                    if isinstance(data, list):
-                                        fetched_items = data
-                                    elif isinstance(data, dict):
-                                        fetched_items = data.get("tasks", data.get("data", []))
+                                response.raise_for_status()  # Capture 4xx/5xx HTTP errors
+                                data = response.json()
+                                if isinstance(data, list):
+                                    fetched_items = data
+                                elif isinstance(data, dict):
+                                    fetched_items = data.get("tasks", data.get("data", []))
 
                         elif method == "websocket":
                             pass
@@ -193,21 +195,33 @@ def execute_engine_scan_cycle() -> dict:
 
                 except Exception as target_exc:
                     errors_encountered += 1
-                    print(f"⚠️ Scan error on {platform_name}: {target_exc}")
+                    err_type = type(target_exc).__name__
+                    err_msg = str(target_exc) or "No error message"
+                    detailed_err = f"{platform_name} ({err_type}: {err_msg})"
+                    error_summary.append(detailed_err)
+
+                    print(f"⚠️ Scan error on {detailed_err}")
+
                     try:
                         with conn.transaction():
                             conn.execute(
-                                "UPDATE targets SET consecutive_failures = consecutive_failures + 1 WHERE platform_name = %s",
+                                """
+                                UPDATE targets 
+                                SET consecutive_failures = consecutive_failures + 1, 
+                                    last_checked = NOW() 
+                                WHERE platform_name = %s
+                                """,
                                 (platform_name,),
                             )
                     except Exception:
                         pass
 
+        error_text = f"\n• Errors: `{errors_encountered}`" if errors_encountered > 0 else ""
         report = (
             f"⚡ *SolveEase Engine Scan Report*\n"
             f"• Active Targets Scanned: `{scanned_count}`\n"
-            f"• New Tasks Discovered: `{tasks_discovered}`\n"
-            f"• Errors Encountered: `{errors_encountered}`\n"
+            f"• New Tasks Discovered: `{tasks_discovered}`"
+            f"{error_text}\n"
             f"• Status: `Operational`"
         )
         send_telegram_alert(report)
@@ -217,6 +231,7 @@ def execute_engine_scan_cycle() -> dict:
             "scanned_targets": scanned_count,
             "tasks_discovered": tasks_discovered,
             "errors": errors_encountered,
+            "error_details": error_summary,
         }
 
     except Exception as exc:
@@ -227,7 +242,7 @@ def execute_engine_scan_cycle() -> dict:
 
 
 # --------------------------------------------------
-# TASK EXECUTION WORKER LOOP (AUTOMATED EXECUTION)
+# TASK EXECUTION WORKER LOOP
 # --------------------------------------------------
 
 async def task_execution_worker_loop():
@@ -242,7 +257,6 @@ async def task_execution_worker_loop():
         try:
             with connect_database() as conn:
                 with conn.transaction():
-                    # Atomically claim the top pending task without race conditions
                     task = conn.execute(
                         """
                         SELECT id, task_id, source_platform, category, payout_usd, est_seconds
@@ -261,25 +275,19 @@ async def task_execution_worker_loop():
                         source = task["source_platform"]
                         payout = task["payout_usd"]
 
-                        # Mark as processing
                         conn.execute(
                             "UPDATE tasks SET status = 'processing' WHERE id = %s",
                             (task_row_id,)
                         )
                         print(f"⚙️ Processing task {task_id} from {source} (Payout: ${payout})...")
 
-                        # --- PLACEHOLDER FOR ACTUAL TASK EXECUTION LOGIC ---
-                        # (e.g. running your automated extraction or API action here)
                         await asyncio.sleep(2)  # Simulate execution duration
-                        # --------------------------------------------------
 
-                        # Mark as completed
                         conn.execute(
                             "UPDATE tasks SET status = 'completed' WHERE id = %s",
                             (task_row_id,)
                         )
                         
-                        # Dispatch success alert to Telegram monitor
                         send_telegram_alert(
                             f"✅ *Task Executed Successfully*\n"
                             f"• Source: `{source}`\n"
@@ -289,12 +297,11 @@ async def task_execution_worker_loop():
         except Exception as worker_exc:
             print(f"⚠️ Task execution worker error: {worker_exc}")
 
-        # Poll queue interval (e.g. check every 5 seconds for pending tasks)
         await asyncio.sleep(5)
 
 
 # --------------------------------------------------
-# BACKGROUND ASYNCHRONOUS SCANNER LOOP
+# BACKGROUND SCANNING LOOP
 # --------------------------------------------------
 
 async def background_scanning_loop():
@@ -356,7 +363,6 @@ async def startup_event():
             except Exception as exc:
                 print(f"⚠️ Startup seeding skipped/failed: {exc}")
 
-    # Start both background daemons concurrently
     asyncio.create_task(background_scanning_loop())
     asyncio.create_task(task_execution_worker_loop())
     print("✨ Background daemons initialized successfully.")
@@ -370,7 +376,7 @@ async def startup_event():
 def root():
     return {
         "service": "SolveEase 300-Target Task Engine API",
-        "version": "1.7.0",
+        "version": "1.8.0",
         "status": "running",
         "database": "Neon PostgreSQL",
         "health_endpoint": "/api/health",
@@ -614,4 +620,4 @@ def trigger_engine_poll():
         result = execute_engine_scan_cycle()
         return {"status": "triggered", **result, "message": "Manual engine scan completed successfully."}
     except Exception as exc:
-        raise HTTPException(status_output=503, detail=f"Engine trigger failed: {str(exc)}") from exc
+        raise HTTPException(status_code=503, detail=f"Engine trigger failed: {str(exc)}") from exc
