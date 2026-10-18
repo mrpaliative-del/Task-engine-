@@ -80,12 +80,14 @@ def connect_database():
 def database_error(operation: str, exc: Exception):
     detail = str(exc)
 
-    # Redact common database URL credentials.
+    # Redact credentials embedded in PostgreSQL URLs.
     detail = re.sub(
         r"(?i)(postgres(?:ql)?://)[^@\s]+@",
         r"\1[REDACTED]@",
         detail,
     )
+
+    # Redact common password assignments.
     detail = re.sub(
         r"(?i)\b(password|passwd|pwd)\s*=\s*[^;\s]+",
         r"\1=[REDACTED]",
