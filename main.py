@@ -20,7 +20,7 @@ from pydantic import BaseModel, Field, field_validator
 
 # ============================================================
 # SolveEase 300-Target Task Engine
-# Version 2.0.1 — Neon PostgreSQL
+# Version 2.0.2 — Neon PostgreSQL
 #
 # API manages targets, queue visibility and manual feed scans.
 # worker.py owns continuous feed polling.
@@ -28,7 +28,7 @@ from pydantic import BaseModel, Field, field_validator
 # ============================================================
 
 APP_NAME = "SolveEase 300-Target Task Engine"
-APP_VERSION = "2.0.1"
+APP_VERSION = "2.0.2"
 
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 ENGINE_API_KEY = os.getenv("ENGINE_API_KEY", "").strip()
@@ -78,8 +78,9 @@ def connect_database():
 
 
 def database_error(operation: str, exc: Exception):
-    # Redact common credential formats before writing logs.
     detail = str(exc)
+
+    # Redact common database URL credentials.
     detail = re.sub(
         r"(?i)(postgres(?:ql)?://)[^@\s]+@",
         r"\1[REDACTED]@",
@@ -176,7 +177,6 @@ def validate_endpoint_url(value: str, method: str) -> str:
     except ValueError as exc:
         if "not allowed" in str(exc):
             raise
-        # A normal DNS hostname is not an IP literal.
         if ":" in host:
             raise ValueError("Invalid endpoint hostname") from None
 
